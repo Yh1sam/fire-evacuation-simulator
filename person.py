@@ -33,6 +33,7 @@ class Person:
         self.rate = rate
         self.strategy = strategy
         self.loc = tuple(loc)
+        self.start_loc = tuple(loc)
 
 
     def move(self, nbrs, rv=None):

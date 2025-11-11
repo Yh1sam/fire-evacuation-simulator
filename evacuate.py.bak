@@ -196,12 +196,8 @@ class FireSim:
 
         r, c = 0, 0
         for loc, attrs in self.graph.items():
-            if isinstance(loc, tuple) and len(loc)==3:
-                i,j = loc[1], loc[2]
-            else:
-                i,j = loc[0], loc[1]
-            r = max(r, i)
-            c = max(c, j)
+            r = max(r, loc[0])
+            c = max(c, loc[1])
             if attrs['P']: av_locs += [loc]
             elif attrs['B']: bottleneck_locs += [loc]
             elif attrs['F']: fire_locs += [loc]
@@ -235,48 +231,10 @@ class FireSim:
     def visualize(self, t):
         '''
         '''
-        if not self.gui:
-            return
-        # Adapt multi-layer graphs to 2D slice for visualization
-        sample_key = next(iter(self.graph))
-        graph2d = None
-        people2d = None
-        if isinstance(sample_key, tuple) and len(sample_key) == 3:
-            layer = getattr(self, 'viz_layer', 0)
-            graph2d = {}
-            # build 2D graph for the chosen layer
-            for key, attrs in self.graph.items():
-                if not (isinstance(key, tuple) and len(key) == 3):
-                    continue
-                z, i, j = key
-                if z != layer:
-                    continue
-                new_attrs = {k: v for k, v in attrs.items() if k != 'nbrs'}
-                nbrs2d = set()
-                for n in attrs['nbrs']:
-                    if isinstance(n, tuple) and len(n) == 3:
-                        zz, ii, jj = n
-                        if zz == layer:
-                            nbrs2d.add((ii, jj))
-                    elif isinstance(n, tuple) and len(n) == 2:
-                        nbrs2d.add(n)
-                new_attrs['nbrs'] = nbrs2d
-                graph2d[(i, j)] = new_attrs
-            # project people on that layer
-            from types import SimpleNamespace as NS
-            people2d = []
-            for p in self.people:
-                if isinstance(p.loc, tuple) and len(p.loc) == 3:
-                    z, i, j = p.loc
-                    if z != layer:
-                        continue
-                    people2d.append(NS(id=p.id, loc=(i, j), safe=p.safe, alive=p.alive))
-                else:
-                    people2d.append(NS(id=p.id, loc=p.loc, safe=p.safe, alive=p.alive))
-        else:
-            graph2d = self.graph
-            people2d = self.people
-        self.plotter.visualize(graph2d, people2d, t)
+        if self.gui:
+            self.plotter.visualize(self.graph, self.people, t)
+
+
     def update_bottlenecks(self):
         '''
         handles the bottleneck zones on the grid, where people cannot all pass
