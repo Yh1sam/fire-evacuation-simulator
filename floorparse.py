@@ -136,77 +136,71 @@ class FloorParser:
                     s += '{:>4}'.format(att)
                 s += '\n'
             return s
-
-    # New: parse from PNG image directly
-    def parse_image(self, path, tile_px=None, palette=None):
+    def parse_image(self, path, palette=None):
         '''
-        Read a PNG/JPG image and convert to graph.
-        - If the PNG has text chunk 'map_meta' with tile_px, we use it.
-        - Else tile_px defaults to 10 (10 px = 1 m). If width/height are not
-          divisible, we fall back to gcd(width,height) if <=64, else raise.
-        - Colors are mapped to tokens W/N/S/B/F/P by nearest color distance.
+        Parse a PNG/JPG image as a single-layer grid.
+        Each pixel is treated as one cell (0.5m x 0.5m in your physical model).
+        Colors are mapped to tokens W/N/S/B/F/P/Z by nearest color distance.
+        If PNG has a 'map_meta' text chunk with cell_px>1, we average blocks of
+        that many pixels per cell instead.
         '''
         try:
-            from PIL import Image, PngImagePlugin
+            from PIL import Image
         except Exception as e:
             raise RuntimeError('Pillow is required to read PNG maps: '+str(e))
         DEFAULT_PAL = {
+
             'W': (0, 0, 0),
             'N': (191, 227, 240),
             'S': (92, 184, 92),
             'B': (33, 59, 143),
             'F': (217, 83, 79),
             'P': (91, 192, 222),
+            'Z': (153, 0, 153),
         }
-        pal = dict(DEFAULT_PAL)
         if palette:
             pal.update(palette)
         img = Image.open(path).convert('RGB')
         W, H = img.size
-        # try metadata
-        try:
-            meta = img.text if hasattr(img, 'text') else {}
-            if not meta and hasattr(img, 'info'):
-                meta = img.info
-            if meta and 'map_meta' in meta:
+        cell_px = 1
+        # optional metadata
+        meta = getattr(img, "text", {}) or getattr(img, "info", {})
+        if 'map_meta' in meta:
+            try:
                 import json as _json
                 m = _json.loads(meta['map_meta'])
-                tile_px = tile_px or int(m.get('tile_px', 10))
-        except Exception:
-            pass
-        # default tile
-        if not tile_px:
-            tile_px = 10
-        if (W % tile_px != 0) or (H % tile_px != 0):
-            import math
-            g = math.gcd(W, H)
-            if 1 < g <= 64:
-                tile_px = g
-            else:
-                raise ValueError(f'Image size {W}x{H} not divisible by tile_px={tile_px}')
-        R, C = H//tile_px, W//tile_px
+                if 'cell_px' in m:
+                    cell_px = max(1, int(m['cell_px']))
+                elif 'tile_px' in m:
+                    cell_px = max(1, int(m['tile_px']))
+            except Exception:
+                cell_px = 1
+        from math import gcd
+        if (W % cell_px != 0) or (H % cell_px != 0):
+            g = gcd(W, H) or 1
+            cell_px = g
+        R, C = H//cell_px, W//cell_px
         px = img.load()
         def block_avg(i,j):
             rs=gs=bs=0; cnt=0
-            for di in range(tile_px):
-                for dj in range(tile_px):
-                    r,g,b = px[j*tile_px+dj, i*tile_px+di]
+            for di in range(cell_px):
+                for dj in range(cell_px):
+                    r,g,b = px[j*cell_px+dj, i*cell_px+di]
                     rs+=r; gs+=g; bs+=b; cnt+=1
             return (rs//cnt, gs//cnt, bs//cnt)
         def nearest_token(rgb):
-            r,g,b = rgb; best='N'; bestd=10**12
-            for t,(R,G,B) in pal.items():
-                d=(r-R)*(r-R)+(g-G)*(g-G)+(b-B)*(b-B)
+            r,g,b = rgb; best="N"; bestd=10**12
+            for t,(Rr,Gg,Bb) in pal.items():
+                d=(r-Rr)*(r-Rr)+(g-Gg)*(g-Gg)+(b-Bb)*(b-Bb)
                 if d<bestd: bestd=d; best=t
             return best
-        # Build graph
+        from collections import defaultdict
         graph = defaultdict(lambda: {'nbrs': set()})
         for i in range(R):
             for j in range(C):
                 tok = nearest_token(block_avg(i,j))
-                for att in 'WSBFNP':
+                for att in "WSBFNPZ":
                     graph[(i,j)][att] = int(att == tok)
-        # neighbors
         for i in range(R):
             for j in range(C):
                 for di,dj in ((-1,0),(1,0),(0,-1),(0,1)):
