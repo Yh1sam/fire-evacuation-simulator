@@ -1,0 +1,6 @@
+Input: in\arena_cshape_80x50_wide3.txt
+N: 3500
+speed: 0.2
+bottleneck_delay: 0.2
+Average time to safe: 132.818 s
+Total evacuation time: 637.581 s

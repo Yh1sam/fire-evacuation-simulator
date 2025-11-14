@@ -55,6 +55,7 @@ class FireSim:
                  person_mover=random.uniform, fire_mover=random.sample,
                  fire_rate=2, bottleneck_delay=1, animation_delay=.1,
                  verbose=False, scale_factor=20, sample_k=8, sample_seed=123, seconds_per_unit=1.0,
+                 start_delay_generator=lambda: 0.0,
                  **kwargs):
         '''
         constructor method
@@ -85,6 +86,7 @@ class FireSim:
         self.sample_k = sample_k
         self.sample_seed = sample_seed
         self.seconds_per_unit = seconds_per_unit
+        self.start_delay_generator = start_delay_generator
         # Transform: remove fire (treat as walls) and scale map
         self.convert_fire_to_walls()
         self.scale_graph(self.scale_factor)
@@ -211,6 +213,7 @@ class FireSim:
             p = Person(i, self.rate_generator(),
                        self.strategy_generator(),
                        self.location_sampler(av_locs))
+            p.start_delay = float(max(0.0, self.start_delay_generator()))
             self.people += [p]
 
         for loc in bottleneck_locs:
@@ -432,7 +435,7 @@ class FireSim:
             loc = tuple(p.loc)
             square = self.graph[loc]
             nbrs = square['nbrs']
-            self.sim.sched(self.update_person, i, offset=1/p.rate)
+            self.sim.sched(self.update_person, i, offset=getattr(p, 'start_delay', 0.0) + 1/p.rate)
 
         # fire disabled; treated as walls
         print('INFO\t', 'fire disabled (treated as walls)')
@@ -530,23 +533,29 @@ def main():
                         help='random seed for sampling agents')
     parser.add_argument('--seconds-per-unit', type=float, default=1.0,
                         help='real seconds per simulation time unit for reporting (default: 1.0)')
+    parser.add_argument('--start-delay-dist', choices=['none','exp','normal'], default='none',
+                        help='distribution for per-person start delay before first move')
+    parser.add_argument('--start-delay', type=float, default=0.0,
+                        help='mean delay (exp) or mean (normal), in seconds')
+    parser.add_argument('--start-delay-std', type=float, default=0.0,
+                        help='std dev for normal delay (seconds)')
     args = parser.parse_args()
     # output them as a make-sure-this-is-what-you-meant
     print('commandline arguments:', args, '\n')
 
     # set up random streams
     try:
-        streams = [Generator(PCG64(args.random_state, i)) for i in range(5)]
+        streams = [Generator(PCG64(args.random_state, i)) for i in range(6)]
     except TypeError:
         # Fallback for numpy.random.PCG64 which doesn't take an increment param
         try:
             from numpy.random import SeedSequence
-            sseq = SeedSequence(args.random_state).spawn(5)
+            sseq = SeedSequence(args.random_state).spawn(6)
             streams = [Generator(PCG64(s)) for s in sseq]
         except Exception:
             # Last resort: offset the seed
-            streams = [Generator(PCG64(args.random_state + i)) for i in range(5)]
-    loc_strm, strat_strm, rate_strm, pax_strm, fire_strm = streams
+            streams = [Generator(PCG64(args.random_state + i)) for i in range(6)]
+    loc_strm, strat_strm, rate_strm, pax_strm, fire_strm, delay_strm = streams
 
     location_sampler = loc_strm.choice # used to make initial placement of pax
     strategy_generator = lambda: strat_strm.uniform(.5, 1) # used to pick move
@@ -556,13 +565,22 @@ def main():
     person_mover = lambda: pax_strm.uniform() #
     fire_mover = lambda a: fire_strm.choice(a) #
 
+    # per-person start delay generator
+    if args.start_delay_dist == 'exp' and args.start_delay > 0:
+        start_delay_generator = lambda: float(max(0.0, delay_strm.exponential(args.start_delay)))
+    elif args.start_delay_dist == 'normal' and args.start_delay > 0:
+        sd = max(args.start_delay_std, 1e-6)
+        start_delay_generator = lambda: float(max(0.0, delay_strm.normal(args.start_delay, sd)))
+    else:
+        start_delay_generator = lambda: 0.0  # no delay
     # create an instance of Floor
+
     floor = FireSim(args.input, args.numpeople, location_sampler,
                     strategy_generator, rate_generator, person_mover,
                     fire_mover, fire_rate=args.fire_rate,
                     bottleneck_delay=args.bottleneck_delay,
                     animation_delay=args.animation_delay, verbose=args.output,
-                    scale_factor=args.scale, sample_k=args.sample_k, sample_seed=args.sample_seed, seconds_per_unit=args.seconds_per_unit)
+                    scale_factor=args.scale, sample_k=args.sample_k, sample_seed=args.sample_seed, seconds_per_unit=args.seconds_per_unit, start_delay_generator=start_delay_generator)
 
     # floor.visualize(t=5000)
     # call the simulate method to run the actual simulation
@@ -573,3 +591,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
