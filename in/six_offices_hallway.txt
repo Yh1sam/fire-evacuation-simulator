@@ -1,0 +1,13 @@
+W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;W;W;W;N;W;W;W;W;W;W;N;W;W;W;W;W;W;N;W;W;W;W
+W;S;B;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;B;S;W
+W;S;B;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;B;S;W
+W;W;W;W;N;W;W;W;W;W;W;N;W;W;W;W;W;W;N;W;W;W;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;W;P;P;P;P;P;P;P;W;P;P;P;P;P;P;W
+W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W

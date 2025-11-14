@@ -1,0 +1,15 @@
+W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;W;W;W;W;N;W;W;W;W;W;W;W;N;W;W;W;W;W;W;W;W;W;N;W;W;W;W
+W;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;W
+W;S;B;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;B;S;W
+W;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;N;W
+W;W;W;W;W;N;W;W;W;W;W;W;W;N;W;W;W;W;W;W;W;W;W;N;W;W;W;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W;P;P;P;P;P;P;P;P;W
+W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W;W

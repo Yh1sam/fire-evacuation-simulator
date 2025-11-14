@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+
+'''
+This is the main file in the evacuation simulation project.
+people: Nick B., Matthew J., Aalok S.
+
+In this file we define a useful class to model the building floor, 'Floor'
+
+Also in this file, we proceed to provide a main method so that this file is
+meaningfully callable to run a simulation experiment
+'''
+
+# stdlib imports
+import simulus
+import sys
+import pickle
+import random
+import pprint
+from argparse import ArgumentParser
+try:
+    from randomgen import PCG64
+except ImportError:
+    from numpy.random import PCG64
+from numpy.random import Generator
+
+# local project imports
+from person import Person
+from bottleneck import Bottleneck
+from floorparse import FloorParser
+
+pp = pprint.PrettyPrinter(indent=4).pprint
+
+class FireSim:
+    sim = None
+    graph = None # dictionary (x,y) --> attributes
+    gui = False
+    r = None
+    c = None
+
+    numpeople = 0
+    numdead = 0
+    numsafe = 0
+    nummoving = 0
+
+    bottlenecks = dict()
+    fires = set()
+    people = []
+
+    exit_times = []
+    avg_exit = 0 # tracks sum first, then we divide
+
+    def __init__(self, input, n, location_sampler=random.sample,
+                 strategy_generator=lambda: random.uniform(.5, 1.),
+                 rate_generator=lambda: abs(random.normalvariate(1, .5)),
+                 person_mover=random.uniform, fire_mover=random.sample,
+                 fire_rate=2, bottleneck_delay=1, animation_delay=.1,
+                 verbose=False, scale_factor=20, sample_k=8, sample_seed=123, seconds_per_unit=1.0,
+                 start_delay_generator=lambda: 0.0,
+                 **kwargs):
+        '''
+        constructor method
+        ---
+        graph (dict): a representation of the floor plan as per our
+                      specification
+        n (int): number of people in the simulation
+        '''
+        self.sim = simulus.simulator()
+        self.parser = FloorParser() 
+        self.animation_delay = animation_delay
+        self.verbose = verbose
+
+        with open(input, 'r') as f:
+            self.graph = self.parser.parse(f.read())
+        self.numpeople = n
+
+        self.location_sampler = location_sampler
+        self.strategy_generator = strategy_generator
+        self.rate_generator = rate_generator
+        self.person_mover = person_mover
+        self.fire_mover = fire_mover
+        
+        self.fire_rate = fire_rate
+        self.bottleneck_delay = bottleneck_delay
+        self.kwargs = kwargs
+        self.scale_factor = scale_factor
+        self.sample_k = sample_k
+        self.sample_seed = sample_seed
+        self.seconds_per_unit = seconds_per_unit
+        self.start_delay_generator = start_delay_generator
+        # Transform: remove fire (treat as walls) and scale map
+        self.convert_fire_to_walls()
+        self.scale_graph(self.scale_factor)
+
+        self.setup()
+
+
+
+    def convert_fire_to_walls(self):
+        '''
+        Convert all fire cells to walls and clear fire set.
+        '''
+        graph = self.graph
+        new_fires = set()
+        for loc, attrs in graph.items():
+            if attrs.get('F'):
+                attrs['F'] = 0
+                attrs['W'] = 1
+        self.fires = new_fires
+        self.graph = graph
+
+    def scale_graph(self, factor=1):
+        '''
+        Scale the grid by an integer factor in both dimensions by replicating
+        each cell into a factor x factor block with identical attributes.
+        '''
+        if factor <= 1:
+            return
+        graph = self.graph
+        # determine original dimensions
+        R, C = 0, 0
+        for (i, j) in graph.keys():
+            R = max(R, i)
+            C = max(C, j)
+        R += 1; C += 1
+
+        Rn, Cn = R*factor, C*factor
+        new_graph = {}
+
+        # replicate attributes
+        for i in range(R):
+            for j in range(C):
+                base = graph[(i, j)]
+                attrs_copy = {k: int(base.get(k, 0)) for k in 'WSBFNP'}
+                for di in range(factor):
+                    for dj in range(factor):
+                        I = i*factor + di
+                        J = j*factor + dj
+                        new_attrs = dict(attrs_copy)
+                        new_attrs['nbrs'] = set()
+                        new_graph[(I, J)] = new_attrs
+
+        # construct neighbor lists
+        def inb(i, j):
+            return 0 <= i < Rn and 0 <= j < Cn
+        for I in range(Rn):
+            for J in range(Cn):
+                nbrs = []
+                for di, dj in ((-1,0),(1,0),(0,-1),(0,1)):
+                    i2, j2 = I+di, J+dj
+                    if inb(i2, j2):
+                        nbrs.append((i2, j2))
+                new_graph[(I, J)]['nbrs'] = set(nbrs)
+
+        self.graph = new_graph
+    def precompute(self):
+        '''
+        precompute stats on the graph. Here we compute distS using a multi-source BFS.
+        Fire is disabled and treated as walls, so distF is set to infinity.
+        '''
+        from collections import deque
+        graph = self.graph
+
+        # initialize distances
+        for loc, attrs in graph.items():
+            attrs['distS'] = float('inf')
+            attrs['distF'] = float('inf')
+
+        # multi-source BFS from all safe zones
+        q = deque()
+        for loc, attrs in graph.items():
+            if attrs.get('S'):
+                attrs['distS'] = 0
+                q.append(loc)
+
+        while q:
+            u = q.popleft()
+            du = graph[u]['distS']
+            for v in graph[u]['nbrs']:
+                vat = graph[v]
+                if vat.get('W'):
+                    continue
+                if vat['distS'] > du + 1:
+                    vat['distS'] = du + 1
+                    q.append(v)
+
+        self.graph = dict(graph.items())
+        return self.graph
+    def setup(self):
+        '''
+        once we have the parameters and random variate generation methods from
+        __init__, we can proceed to create instances of: people and bottlenecks
+        '''
+        self.precompute()
+
+        av_locs = []
+        bottleneck_locs = []
+        fire_locs = []
+
+        r, c = 0, 0
+        for loc, attrs in self.graph.items():
+            if isinstance(loc, tuple) and len(loc)==3:
+                i,j = loc[1], loc[2]
+            else:
+                i,j = loc[0], loc[1]
+            r = max(r, i)
+            c = max(c, j)
+            if attrs['P']: av_locs += [loc]
+            elif attrs['B']: bottleneck_locs += [loc]
+            elif attrs['F']: fire_locs += [loc]
+
+        assert len(av_locs) > 0, 'ERR: no people placement locations in input'
+        for i in range(self.numpeople):
+            p = Person(i, self.rate_generator(),
+                       self.strategy_generator(),
+                       self.location_sampler(av_locs))
+            p.start_delay = float(max(0.0, self.start_delay_generator()))
+            self.people += [p]
+
+        for loc in bottleneck_locs:
+            b = Bottleneck(loc)
+            self.bottlenecks[loc] = b
+        self.fires.update(set(fire_locs))
+
+        self.r, self.c = r+1, c+1
+
+        print(
+              '='*79,
+              'initialized a {}x{} floor with {} people in {} locations'.format(
+                    self.r, self.c, len(self.people), len(av_locs)
+                  ),
+              'initialized {} bottleneck(s)'.format(len(self.bottlenecks)),
+              'detected {} fire zone(s)'.format(len([loc for loc in self.graph
+                                                     if self.graph[loc]['F']])),
+              '\ngood luck escaping!', '='*79, 'LOGS', sep='\n'
+             )
+
+
+    def visualize(self, t):
+        '''
+        '''
+        if not self.gui:
+            return
+        # Adapt multi-layer graphs to 2D slice for visualization
+        sample_key = next(iter(self.graph))
+        graph2d = None
+        people2d = None
+        if isinstance(sample_key, tuple) and len(sample_key) == 3:
+            layer = getattr(self, 'viz_layer', 0)
+            graph2d = {}
+            # build 2D graph for the chosen layer
+            for key, attrs in self.graph.items():
+                if not (isinstance(key, tuple) and len(key) == 3):
+                    continue
+                z, i, j = key
+                if z != layer:
+                    continue
+                new_attrs = {k: v for k, v in attrs.items() if k != 'nbrs'}
+                nbrs2d = set()
+                for n in attrs['nbrs']:
+                    if isinstance(n, tuple) and len(n) == 3:
+                        zz, ii, jj = n
+                        if zz == layer:
+                            nbrs2d.add((ii, jj))
+                    elif isinstance(n, tuple) and len(n) == 2:
+                        nbrs2d.add(n)
+                new_attrs['nbrs'] = nbrs2d
+                graph2d[(i, j)] = new_attrs
+            # project people on that layer
+            from types import SimpleNamespace as NS
+            people2d = []
+            for p in self.people:
+                if isinstance(p.loc, tuple) and len(p.loc) == 3:
+                    z, i, j = p.loc
+                    if z != layer:
+                        continue
+                    people2d.append(NS(id=p.id, loc=(i, j), safe=p.safe, alive=p.alive))
+                else:
+                    people2d.append(NS(id=p.id, loc=p.loc, safe=p.safe, alive=p.alive))
+        else:
+            graph2d = self.graph
+            people2d = self.people
+        self.plotter.visualize(graph2d, people2d, t)
+    def update_bottlenecks(self):
+        '''
+        handles the bottleneck zones on the grid, where people cannot all pass
+        at once. for simplicity, bottlenecks are treated as queues
+        '''
+
+        for key in self.bottlenecks:
+            #print(key, self.bottlenecks[key])
+            personLeaving = self.bottlenecks[key].exitBottleNeck()
+            if(personLeaving != None):
+                self.sim.sched(self.update_person, personLeaving.id, offset=0)
+
+        if self.numsafe + self.numdead >= self.numpeople:
+            return
+
+        if self.maxtime and self.sim.now >= self.maxtime:
+            return
+        else:
+            self.sim.sched(self.update_bottlenecks, 
+                           offset=self.bottleneck_delay)
+
+
+
+    def update_fire(self):
+        '''
+        method that controls the spread of fire. we use a rudimentary real-world
+        model that spreads fire exponentially faster proportional to the amount
+        of fire already on the floor. empty nodes are more likely to get set
+        on fire the more lit neighbors they have. empty plain nodes are more
+        likely to burn than walls.
+        fire spreads proportional to (grid_area)/(fire_area)**exp
+        the method uses the 'fire_rate' instance variable as the 'exp' in the
+        expression above.
+        fire stops spreading once it's everywhere, or when all the people have
+        stopped moving (when all are dead or safe, not moving)
+        '''
+        if self.numsafe + self.numdead >= self.numpeople:
+            print('INFO:', 'people no longer moving, so stopping fire spread')
+            return
+        if self.maxtime and self.sim.now >= self.maxtime:
+            return
+
+        no_fire_nbrs = [] # list, not set because more neighbors = more likely
+        for loc in self.fires:
+            # gets the square at the computed location
+            square = self.graph[loc]
+
+            # returns the full list of nbrs of the square
+            nbrs = [(coords, self.graph[coords]) for coords in square['nbrs']]
+
+            # updates nbrs to exclude safe zones and spaces already on fire
+            no_fire_nbrs += [(loc, attrs) for loc, attrs in nbrs
+                             if attrs['S'] == attrs['F'] == 0]
+            # more likely (twice) to spread to non-wall empty zone
+            no_fire_nbrs += [(loc, attrs) for loc, attrs in nbrs
+                             if attrs['W'] == attrs['S'] == attrs['F'] == 0]
+
+        try:
+            (choice, _) = self.fire_mover(no_fire_nbrs)
+        except ValueError as e:
+            print('INFO:', 'fire is everywhere, so stopping fire spread')
+            return
+
+        self.graph[choice]['F'] = 1
+        self.fires.add(choice)
+
+        self.precompute()
+        rt = self.fire_rate
+        self.sim.sched(self.update_fire,
+                       offset=len(self.graph)/max(1, len(self.fires))**rt)
+
+        self.visualize(self.animation_delay/max(1, len(self.fires))**rt)
+
+        return choice
+
+
+    def update_person(self, person_ix):
+        '''
+        handles scheduling an update for each person, by calling move() on them.
+        move will return a location decided by the person, and this method will
+        handle the simulus scheduling part to keep it clean
+        '''
+        if self.maxtime and self.sim.now >= self.maxtime:
+            return
+
+        p = self.people[person_ix]
+        if self.graph[p.loc]['F'] or not p.alive:
+            p.alive = False
+            self.numdead += 1
+            if self.verbose:
+                print('{:>6.2f}\tPerson {:>3} at {} could not make it'.format(
+                                                                  self.sim.now,
+                                                                  p.id, p.loc))
+            return
+        if p.safe:
+            self.numsafe += 1
+            p.exit_time = self.sim.now
+            self.exit_times += [p.exit_time]
+            self.avg_exit += p.exit_time
+            if self.verbose:
+                print('{:>6.2f}\tPerson {:>3} is now SAFE!'.format(self.sim.now, 
+                                                               p.id))
+            return
+
+        loc = p.loc
+        square = self.graph[loc]
+        nbrs = [(coords, self.graph[coords]) for coords in square['nbrs']]
+
+        target = p.move(nbrs)
+        if not target:
+            p.alive = False
+            self.numdead += 1
+            if self.verbose:
+                print('{:>6.2f}\tPerson {:>3} at {} got trapped in fire'.format(
+                                                                   self.sim.now,
+                                                                   p.id, p.loc))
+            return
+        square = self.graph[target]
+        if square['B']:
+            b = self.bottlenecks[target]
+            b.enterBottleNeck(p)
+        elif square['F']:
+            p.alive = False
+            self.numdead += 1
+            return
+        else:
+            t = 1/p.rate
+            if self.sim.now + t >= (self.maxtime or float('inf')):
+                if square['S']:
+                    self.nummoving += 1
+                else:
+                    self.numdead += 1
+            else:
+                self.sim.sched(self.update_person, person_ix, offset=1/p.rate)
+
+        if (1+person_ix) % int(self.numpeople**.5) == 0:
+            self.visualize(t=self.animation_delay/len(self.people)/2)
+
+        # self.sim.show_calendar()
+
+
+    def simulate(self, maxtime=None, spread_fire=False, gui=False):
+        '''
+        sets up initial scheduling and calls the sim.run() method in simulus
+        '''
+        self.gui = gui
+        if self.gui: 
+            from viz import Plotter
+            self.plotter = Plotter()
+
+        # set initial movements of all the people
+        for i, p in enumerate(self.people):
+            loc = tuple(p.loc)
+            square = self.graph[loc]
+            nbrs = square['nbrs']
+            self.sim.sched(self.update_person, i, offset=getattr(p, 'start_delay', 0.0) + 1/p.rate)
+
+        # fire disabled; treated as walls
+        print('INFO\t', 'fire disabled (treated as walls)')
+        self.sim.sched(self.update_bottlenecks, offset=self.bottleneck_delay)
+
+        self.maxtime = maxtime
+        self.sim.run()
+
+        self.avg_exit /= max(self.numsafe, 1)
+
+
+    def stats(self):
+        '''
+        computes and outputs useful stats about the simulation for nice output
+        '''
+        print('\n\n', '='*79, sep='')
+        print('STATS')
+
+        def printstats(desc, obj):
+            print('\t',
+                  (desc+' ').ljust(30, '.') + (' '+str(obj)).rjust(30, '.'))
+
+        printstats('total # people', self.numpeople)
+        printstats('# people safe', self.numsafe)
+        printstats('# people dead', self.numpeople-self.numsafe-self.nummoving)
+        printstats('# people gravely injured', self.nummoving)
+        print()
+        if self.exit_times:
+            self.avg_exit = self.avg_exit if self.numsafe==0 else self.avg_exit
+            printstats('average time to safe', '{:.3f} s'.format(self.avg_exit * getattr(self, 'seconds_per_unit', 1.0)))
+            total_evac = max(self.exit_times)
+            printstats('total evacuation time', '{:.3f} s'.format(total_evac * getattr(self, 'seconds_per_unit', 1.0)))
+        else:
+            printstats('average time to safe', 'NA')
+            printstats('total evacuation time', 'NA')
+        print()
+
+        # sample a few agents
+        try:
+            import random as _r
+            R = _r.Random(self.sample_seed)
+            safe_people = [p for p in self.people if p.safe]
+            k = min(getattr(self, 'sample_k', 5), len(safe_people))
+            if k:
+                print('SAMPLE ({} agents)'.format(k))
+                for p in R.sample(safe_people, k):
+                    print('  id {:>4} | exit_time {:>8.3f} s | start {} -> final {}'
+                          .format(p.id, p.exit_time, getattr(p, 'start_loc', p.loc), p.loc))
+                print()
+        except Exception as e:
+            print('WARN sample:', e)
+
+        self.visualize(4)
+
+
+def main():
+    '''
+    driver method for this file. the firesim class can be used via imports as
+    well, but this driver file provides a comprehensive standalone interface
+    to the simulation
+    '''
+    # set up and parse commandline arguments
+    parser = ArgumentParser()
+    parser.add_argument('-i', '--input', type=str,
+                        default='in/twoexitbottleneck.txt',
+                        help='input floor plan file (default: '
+                             'in/twoexitbottleneck.py)')
+    parser.add_argument('-n', '--numpeople', type=int, default=10,
+                        help='number of people in the simulation (default:10)')
+    parser.add_argument('-r', '--random_state', type=int, default=8675309,
+                        help='aka. seed (default:8675309)')
+    parser.add_argument('-t', '--max_time', type=float, default=None,
+                        help='the building collapses at this clock tick. people'
+                             ' beginning movement before this will be assumed'
+                             ' to have moved away sufficiently (safe)')
+    parser.add_argument('-f', '--no_spread_fire', action='store_true',
+                        help='disallow fire to spread around?')
+    parser.add_argument('-g', '--no_graphical_output', action='store_true',
+                        help='disallow graphics?')
+    parser.add_argument('-o', '--output', action='store_true',
+                        help='show excessive output?')
+    parser.add_argument('-d', '--fire_rate', type=float, default=2,
+                        help='rate of spread of fire (this is the exponent)')
+    parser.add_argument('-b', '--bottleneck_delay', type=float, default=1,
+                        help='how long until the next person may leave the B')
+    parser.add_argument('-a', '--animation_delay', type=float, default=1,
+                        help='delay per frame of animated visualization (s)')
+    parser.add_argument('--scale', type=int, default=8,
+                        help='grid upscaling factor (default: 8)')
+    parser.add_argument('--speed', type=float, default=3.0,
+                        help='movement speed multiplier (default: 3.0)')
+    parser.add_argument('--sample-k', type=int, default=8,
+                        help='number of agents to sample for detailed report')
+    parser.add_argument('--sample-seed', type=int, default=123,
+                        help='random seed for sampling agents')
+    parser.add_argument('--seconds-per-unit', type=float, default=1.0,
+                        help='real seconds per simulation time unit for reporting (default: 1.0)')
+    parser.add_argument('--start-delay-dist', choices=['none','exp','normal'], default='none',
+                        help='distribution for per-person start delay before first move')
+    parser.add_argument('--start-delay', type=float, default=0.0,
+                        help='mean delay (exp) or mean (normal), in seconds')
+    parser.add_argument('--start-delay-std', type=float, default=0.0,
+                        help='std dev for normal delay (seconds)')
+    args = parser.parse_args()
+    # output them as a make-sure-this-is-what-you-meant
+    print('commandline arguments:', args, '\n')
+
+    # set up random streams
+    try:
+        streams = [Generator(PCG64(args.random_state, i)) for i in range(6)]
+    except TypeError:
+        # Fallback for numpy.random.PCG64 which doesn't take an increment param
+        try:
+            from numpy.random import SeedSequence
+            sseq = SeedSequence(args.random_state).spawn(6)
+            streams = [Generator(PCG64(s)) for s in sseq]
+        except Exception:
+            # Last resort: offset the seed
+            streams = [Generator(PCG64(args.random_state + i)) for i in range(6)]
+    loc_strm, strat_strm, rate_strm, pax_strm, fire_strm, delay_strm = streams
+
+    location_sampler = loc_strm.choice # used to make initial placement of pax
+    strategy_generator = lambda: strat_strm.uniform(.5, 1) # used to pick move
+    rate_generator = lambda: max(.1, abs(rate_strm.normal(1, .1))) * args.speed # used to
+                                                                   # decide
+                                                                   # strategies
+    person_mover = lambda: pax_strm.uniform() #
+    fire_mover = lambda a: fire_strm.choice(a) #
+
+    # per-person start delay generator
+    if args.start_delay_dist == 'exp' and args.start_delay > 0:
+        start_delay_generator = lambda: float(max(0.0, delay_strm.exponential(args.start_delay)))
+    elif args.start_delay_dist == 'normal' and args.start_delay > 0:
+        sd = max(args.start_delay_std, 1e-6)
+        start_delay_generator = lambda: float(max(0.0, delay_strm.normal(args.start_delay, sd)))
+    else:
+        start_delay_generator = lambda: 0.0  # no delay
+    # create an instance of Floor
+
+    floor = FireSim(args.input, args.numpeople, location_sampler,
+                    strategy_generator, rate_generator, person_mover,
+                    fire_mover, fire_rate=args.fire_rate,
+                    bottleneck_delay=args.bottleneck_delay,
+                    animation_delay=args.animation_delay, verbose=args.output,
+                    scale_factor=args.scale, sample_k=args.sample_k, sample_seed=args.sample_seed, seconds_per_unit=args.seconds_per_unit, start_delay_generator=start_delay_generator)
+
+    # floor.visualize(t=5000)
+    # call the simulate method to run the actual simulation
+    floor.simulate(maxtime=args.max_time, spread_fire=not args.no_spread_fire,
+                   gui=not args.no_graphical_output)
+
+    floor.stats()
+
+if __name__ == '__main__':
+    main()
+
+

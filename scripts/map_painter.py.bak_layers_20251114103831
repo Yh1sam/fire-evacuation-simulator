@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+map_painter.py
+A simple map drawing tool that works directly on images.
+- Canvas size is set in meters (W,H), with fixed scale 10 pixels = 1 meter.
+- Tools: Brush (adjustable size in meters), Line, Rectangle, Eraser.
+- Palette: Wall(W), Walkable(N), Safe(S), Bottleneck(B), Fire(F), Spawn(P).
+- Grid overlay: 1 m grid (10 px) for guidance (not baked into export by default).
+- Saves PNG with embedded metadata (tile_px=10, meters_per_tile=1.0, width_m, height_m).
+
+Run
+  python scripts/map_painter.py
+
+Shortcuts
+  1..6 switch palette (W,N,S,B,F,P); E=Eraser; B=Brush; L=Line; R=Rect; G=toggle grid; +/- brush size.
+"""
+import os, json, math, sys
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from typing import Tuple
+from PIL import Image, ImageDraw, ImageTk
+from PIL.PngImagePlugin import PngInfo
+
+# Fixed scale: 10 px = 1 m
+TILE_PX = 10
+
+PALETTE = {
+    'W': (0, 0, 0),           # wall
+    'N': (191, 227, 240),     # walkable
+    'S': (92, 184, 92),       # safe
+    'B': (33, 59, 143),       # bottleneck
+    'F': (217, 83, 79),       # fire
+    'P': (91, 192, 222),      # spawn
+}
+PALETTE_ORDER = ['W','N','S','B','F','P']
+
+TOOLS = ['Brush','Line','Rect','Eraser']
+
+class MapPainter(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('Map Painter (10 px = 1 m)')
+        self.geometry('1100x750')
+
+        # State
+        self.width_m = tk.IntVar(value=28)
+        self.height_m = tk.IntVar(value=15)
+        self.brush_m = tk.DoubleVar(value=1.0)
+        self.tool = tk.StringVar(value='Brush')
+        self.color_key = tk.StringVar(value='W')
+        self.show_grid = tk.BooleanVar(value=True)
+        self.snap = tk.BooleanVar(value=True)  # snap to 1m grid
+        self.include_grid_on_save = tk.BooleanVar(value=False)
+
+        self.img = None            # PIL image
+        self.draw = None           # PIL draw
+        self.tkimg = None          # Tk image
+        self.overlay_id = None     # preview shape on canvas
+        self.dragging = False
+        self.start_xy = None
+
+        self._build_ui()
+        self.new_canvas()
+
+    # UI -----------------------------------------------------------------
+    def _build_ui(self):
+        top = ttk.Frame(self); top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
+        ttk.Label(top, text='Width (m)').pack(side=tk.LEFT)
+        eW = ttk.Entry(top, textvariable=self.width_m, width=6); eW.pack(side=tk.LEFT, padx=(2,8))
+        ttk.Label(top, text='Height (m)').pack(side=tk.LEFT)
+        eH = ttk.Entry(top, textvariable=self.height_m, width=6); eH.pack(side=tk.LEFT, padx=(2,8))
+        ttk.Button(top, text='New Canvas', command=self.new_canvas).pack(side=tk.LEFT, padx=(4,12))
+        ttk.Button(top, text='Open PNG', command=self.open_png).pack(side=tk.LEFT)
+        ttk.Button(top, text='Save PNG', command=self.save_png).pack(side=tk.LEFT, padx=(4,8))
+        ttk.Checkbutton(top, text='Grid', variable=self.show_grid, command=self.redraw).pack(side=tk.LEFT, padx=(8,4))
+        ttk.Checkbutton(top, text='Snap', variable=self.snap).pack(side=tk.LEFT)
+        ttk.Checkbutton(top, text='Export grid', variable=self.include_grid_on_save).pack(side=tk.LEFT, padx=(8,0))
+
+        # Tool bar
+        bar = ttk.Frame(self); bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=4)
+        for tname in TOOLS:
+            ttk.Radiobutton(bar, text=tname, value=tname, variable=self.tool).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar, text='Brush (m)').pack(side=tk.LEFT, padx=(12,2))
+        self.brush_spin = ttk.Spinbox(bar, from_=0.1, to=10.0, increment=0.1, textvariable=self.brush_m, width=6)
+        self.brush_spin.pack(side=tk.LEFT)
+
+        # Palette
+        pal = ttk.Frame(self); pal.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(2,6))
+        ttk.Label(pal, text='Palette:').pack(side=tk.LEFT)
+        for key in PALETTE_ORDER:
+            btn = ttk.Radiobutton(pal, text=key, value=key, variable=self.color_key)
+            btn.pack(side=tk.LEFT, padx=2)
+            sw = tk.Canvas(pal, width=24, height=16, highlightthickness=1, highlightbackground='#888')
+            sw.pack(side=tk.LEFT, padx=(0,8))
+            R,G,B = PALETTE[key]
+            sw.create_rectangle(0,0,24,16, fill='#%02x%02x%02x'% (R,G,B), outline='')
+
+        # Canvas + scroll
+        wrap = ttk.Frame(self); wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(wrap, bg='white')
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sx = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        sy = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=sx.set, yscrollcommand=sy.set)
+        sx.pack(side=tk.BOTTOM, fill=tk.X)
+        sy.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bindings
+        self.canvas.bind('<Button-1>', self.on_down)
+        self.canvas.bind('<B1-Motion>', self.on_drag)
+        self.canvas.bind('<ButtonRelease-1>', self.on_up)
+        self.bind('<Key>', self.on_key)
+
+    # Canvas creation / file I/O -----------------------------------------
+    def new_canvas(self):
+        W = int(max(1, self.width_m.get())) * TILE_PX
+        H = int(max(1, self.height_m.get())) * TILE_PX
+        # base image starts as walkable N
+        self.img = Image.new('RGB', (W,H), PALETTE['N'])
+        self.draw = ImageDraw.Draw(self.img)
+        self._fit_canvas(W, H)
+        self.redraw()
+
+    def _fit_canvas(self, W, H):
+        self.canvas.config(scrollregion=(0,0,W,H))
+        # draw once
+        self._update_tkimg()
+
+    def open_png(self):
+        path = filedialog.askopenfilename(filetypes=[('PNG','*.png'),('All','*')])
+        if not path: return
+        self.img = Image.open(path).convert('RGB')
+        self.draw = ImageDraw.Draw(self.img)
+        W,H = self.img.size
+        self.width_m.set(W//TILE_PX); self.height_m.set(H//TILE_PX)
+        self._fit_canvas(W,H)
+        self.redraw()
+
+    def save_png(self):
+        path = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG','*.png')])
+        if not path: return
+        to_save = self.img.copy()
+        if self.include_grid_on_save.get():
+            self._draw_grid_on_image(to_save)
+        meta = PngInfo()
+        meta.add_text('map_meta', json.dumps({
+            'tile_px': TILE_PX,
+            'meters_per_tile': 1.0,
+            'width_m': int(self.width_m.get()),
+            'height_m': int(self.height_m.get()),
+        }))
+        to_save.save(path, pnginfo=meta)
+        messagebox.showinfo('Saved', path)
+
+    # Drawing -------------------------------------------------------------
+    def brush_px(self) -> int:
+        return max(1, int(round(self.brush_m.get()*TILE_PX)))
+
+    def _snap_xy(self, x, y):
+        if not self.snap.get():
+            return x, y
+        s = TILE_PX
+        return (x // s) * s + s//2, (y // s) * s + s//2
+
+    def on_down(self, e):
+        x = int(self.canvas.canvasx(e.x)); y = int(self.canvas.canvasy(e.y))
+        x, y = self._snap_xy(x, y)
+        self.dragging = True
+        self.start_xy = (x, y)
+        if self.tool.get() in ('Brush','Eraser'):
+            self._draw_point(x, y)
+
+    def on_drag(self, e):
+        if not self.dragging: return
+        x = int(self.canvas.canvasx(e.x)); y = int(self.canvas.canvasy(e.y))
+        x, y = self._snap_xy(x, y)
+        if self.tool.get() in ('Brush','Eraser'):
+            self._draw_line(self.start_xy, (x,y))
+            self.start_xy = (x,y)
+        else:
+            # preview
+            self._preview_shape(self.start_xy, (x,y))
+
+    def on_up(self, e):
+        if not self.dragging: return
+        x = int(self.canvas.canvasx(e.x)); y = int(self.canvas.canvasy(e.y))
+        x, y = self._snap_xy(x, y)
+        if self.tool.get() == 'Line':
+            self._commit_line(self.start_xy, (x,y))
+        elif self.tool.get() == 'Rect':
+            self._commit_rect(self.start_xy, (x,y))
+        self.dragging = False
+        self.start_xy = None
+        if self.overlay_id is not None:
+            self.canvas.delete(self.overlay_id); self.overlay_id = None
+        self.redraw()
+
+    def _draw_point(self, x, y):
+        half = self.brush_px()//2
+        fill = PALETTE[self.color_key.get()] if self.tool.get()=='Brush' else PALETTE['N']
+        self.draw.rectangle([x-half, y-half, x+half, y+half], fill=fill)
+        self._update_tkimg(partial=True)
+
+    def _draw_line(self, a, b):
+        fill = PALETTE[self.color_key.get()] if self.tool.get()=='Brush' else PALETTE['N']
+        self.draw.line([a, b], fill=fill, width=self.brush_px())
+        self._update_tkimg(partial=True)
+
+    def _commit_line(self, a, b):
+        fill = PALETTE[self.color_key.get()]
+        self.draw.line([a, b], fill=fill, width=self.brush_px())
+
+    def _commit_rect(self, a, b):
+        x0,y0 = a; x1,y1 = b
+        x0,x1 = sorted((x0,x1)); y0,y1 = sorted((y0,y1))
+        fill = PALETTE[self.color_key.get()]
+        self.draw.rectangle([x0,y0,x1,y1], outline=fill, fill=fill, width=0)
+
+    def _preview_shape(self, a, b):
+        if self.overlay_id is not None:
+            self.canvas.delete(self.overlay_id)
+        x0,y0=a; x1,y1=b
+        fill = '#%02x%02x%02x' % PALETTE[self.color_key.get()]
+        if self.tool.get()=='Line':
+            self.overlay_id = self.canvas.create_line(x0,y0,x1,y1, fill=fill, width=self.brush_px())
+        elif self.tool.get()=='Rect':
+            self.overlay_id = self.canvas.create_rectangle(min(x0,x1),min(y0,y1),max(x0,x1),max(y0,y1), outline=fill, width=2)
+
+    # Render --------------------------------------------------------------
+    def _update_tkimg(self, partial=False):
+        # compose base image + optional grid overlay (only for display)
+        disp = self.img.copy()
+        if self.show_grid.get():
+            self._draw_grid_on_image(disp)
+        self.tkimg = ImageTk.PhotoImage(disp)
+        if hasattr(self, 'img_id'):
+            self.canvas.itemconfigure(self.img_id, image=self.tkimg)
+        else:
+            self.img_id = self.canvas.create_image(0,0, image=self.tkimg, anchor='nw')
+
+    def _draw_grid_on_image(self, im):
+        W,H = im.size
+        draw = ImageDraw.Draw(im)
+        s = TILE_PX
+        g = (0,0,0)
+        for x in range(0, W, s):
+            draw.line([(x,0),(x,H-1)], fill=g)
+        for y in range(0, H, s):
+            draw.line([(0,y),(W-1,y)], fill=g)
+
+    def redraw(self):
+        self._update_tkimg()
+
+    # Shortcuts -----------------------------------------------------------
+    def on_key(self, e):
+        ch = e.keysym.lower()
+        if ch == 'g':
+            self.show_grid.set(not self.show_grid.get()); self.redraw()
+        elif ch == 'b':
+            self.tool.set('Brush')
+        elif ch == 'l':
+            self.tool.set('Line')
+        elif ch == 'r':
+            self.tool.set('Rect')
+        elif ch == 'e':
+            self.tool.set('Eraser')
+        elif ch in ('plus','equal'):
+            self.brush_m.set(min(10.0, self.brush_m.get()+0.1))
+        elif ch in ('minus','underscore'):
+            self.brush_m.set(max(0.1, self.brush_m.get()-0.1))
+        elif ch in ('1','2','3','4','5','6'):
+            self.color_key.set(PALETTE_ORDER[int(ch)-1])
+
+
+if __name__ == '__main__':
+    MapPainter().mainloop()
