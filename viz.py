@@ -212,7 +212,7 @@ class Plotter:
 
     # ---- public API -----------------------------------------------------
 
-    def visualize(self, graph={(3, 4): {"F": 1}}, people=None, delay=0.01, stats=None):
+    def visualize(self, graph={(3, 4): {"F": 1}}, people=None, delay=0.01, stats=None, save_path=None):
         """
         Visualize a single-floor map.
 
@@ -245,6 +245,8 @@ class Plotter:
 
         self.fig.tight_layout()
         self.fig.canvas.draw_idle()
+        if save_path:
+            self.fig.savefig(save_path, dpi=150)
         plt.pause(delay)
 
     def visualize_multi(
@@ -254,6 +256,7 @@ class Plotter:
         floor_people,
         stats_per_floor,
         delay=0.01,
+        save_path=None,
     ):
         """
         Visualize multiple floors side-by-side.
@@ -310,4 +313,6 @@ class Plotter:
 
         self.fig.tight_layout()
         self.fig.canvas.draw_idle()
+        if save_path:
+            self.fig.savefig(save_path, dpi=150)
         plt.pause(delay)

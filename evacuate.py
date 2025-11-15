@@ -13,6 +13,8 @@ meaningfully callable to run a simulation experiment
 # stdlib imports
 import simulus
 import sys
+import os
+import shutil
 import pickle
 import random
 import pprint
@@ -68,6 +70,14 @@ class FireSim:
         self.parser = FloorParser() 
         self.animation_delay = animation_delay
         self.verbose = verbose
+
+        # optional output for animation frames
+        self.png_dir = kwargs.pop('png_dir', None)
+        self.frame_total = int(kwargs.pop('frame_total', 300))
+        # how many frames have been saved so far
+        self.frame_index = 0
+        # simulation time of the last saved frame (in sim time units)
+        self.last_frame_time = None
 
         import os
         # allow three kinds of inputs:
@@ -171,7 +181,8 @@ class FireSim:
                         nbrs.append((i2, j2))
                 new_graph[(I, J)]['nbrs'] = set(nbrs)
 
-        self.graph = new_graph    def scale_graph_thin_walls(self, factor=1):
+        self.graph = new_graph
+    def scale_graph_thin_walls(self, factor=1):
         '''
         Increase resolution while keeping wall thickness to one cell.
         Works for 2D maps. Non-wall cells are upscaled by `factor`; each
@@ -363,6 +374,17 @@ class FireSim:
         '''
         if not self.gui:
             return
+        # Optional frame saving (up to frame_total frames)
+        save_path = None
+        if getattr(self, 'png_dir', None) and self.frame_index < self.frame_total:
+            # snapshot at the very start, then every ~1.0 simulation second
+            sim_time = float(getattr(self.sim, 'now', 0.0))
+            if self.last_frame_time is None or sim_time - self.last_frame_time >= 1.0 - 1e-9:
+                fname = f"{sim_time:.2f}.png"
+                save_path = os.path.join(self.png_dir, fname)
+                self.frame_index += 1
+                self.last_frame_time = sim_time
+
         sample_key = next(iter(self.graph))
         # multi-layer: visualize all floors side-by-side with per-floor stats
         if isinstance(sample_key, tuple) and len(sample_key) == 3:
@@ -409,14 +431,14 @@ class FireSim:
             people2d = [floor_people.get(z, []) for z in ordered_floors]
             stats_per_floor = self.compute_floor_stats()
             self.plotter.visualize_multi(
-                ordered_floors, graphs2d, people2d, stats_per_floor, delay=t
+                ordered_floors, graphs2d, people2d, stats_per_floor, delay=t, save_path=save_path
             )
         else:
             # single-layer: behave as before but include global stats
             graph2d = self.graph
             people2d = self.people
             stats = self.compute_floor_stats()
-            self.plotter.visualize(graph2d, people2d, t, stats=stats.get(0))
+            self.plotter.visualize(graph2d, people2d, t, stats=stats.get(0), save_path=save_path)
     def update_bottlenecks(self):
         '''
         handles the bottleneck zones on the grid, where people cannot all pass
@@ -610,20 +632,23 @@ class FireSim:
             printstats('total evacuation time', 'NA')
         print()
 
-        # sample a few agents
+        # detailed per-agent report: list all agents instead of a small sample
         try:
-            import random as _r
-            R = _r.Random(self.sample_seed)
-            safe_people = [p for p in self.people if p.safe]
-            k = min(getattr(self, 'sample_k', 5), len(safe_people))
-            if k:
-                print('SAMPLE ({} agents)'.format(k))
-                for p in R.sample(safe_people, k):
-                    print('  id {:>4} | exit_time {:>8.3f} s | start {} -> final {}'
-                          .format(p.id, p.exit_time, getattr(p, 'start_loc', p.loc), p.loc))
-                print()
+            all_people = sorted(self.people, key=lambda p: p.id)
+            print('AGENTS ({} total)'.format(len(all_people)))
+            for p in all_people:
+                status = 'safe' if getattr(p, 'safe', False) else ('dead' if not getattr(p, 'alive', True) else 'moving')
+                exit_time = getattr(p, 'exit_time', None)
+                if exit_time is not None:
+                    exit_str = '{:.3f} s'.format(exit_time * getattr(self, 'seconds_per_unit', 1.0))
+                else:
+                    exit_str = 'NA'
+                start_loc = getattr(p, 'start_loc', getattr(p, 'loc', None))
+                print('  id {:>4} | status {:>7} | exit_time {:>10} | start {} -> final {}'
+                      .format(p.id, status, exit_str, start_loc, getattr(p, 'loc', None)))
+            print()
         except Exception as e:
-            print('WARN sample:', e)
+            print('WARN agent listing:', e)
 
         self.visualize(4)
 
@@ -677,6 +702,39 @@ def main():
     parser.add_argument('--start-delay-std', type=float, default=0.0,
                         help='std dev for normal delay (seconds)')
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Set up log file and frame output directory under out/{map_name}
+    # ------------------------------------------------------------------
+    def _derive_map_name(inp):
+        base = os.path.basename(os.path.normpath(inp))
+        name, ext = os.path.splitext(base)
+        return name or base
+
+    map_name = _derive_map_name(args.input)
+    out_root = os.path.join('out', map_name)
+    if os.path.isdir(out_root):
+        shutil.rmtree(out_root)
+    os.makedirs(out_root, exist_ok=True)
+    png_dir = os.path.join(out_root, 'png')
+    os.makedirs(png_dir, exist_ok=True)
+    log_path = os.path.join(out_root, 'log.txt')
+
+    class _Tee(object):
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    _log_file = open(log_path, 'w', encoding='utf-8')
+    sys.stdout = _Tee(sys.stdout, _log_file)
+    sys.stderr = _Tee(sys.stderr, _log_file)
+
     # output them as a make-sure-this-is-what-you-meant
     print('commandline arguments:', args, '\n')
 
@@ -717,7 +775,9 @@ def main():
                     fire_mover, fire_rate=args.fire_rate,
                     bottleneck_delay=args.bottleneck_delay,
                     animation_delay=args.animation_delay, verbose=args.output,
-                    scale_factor=args.scale, sample_k=args.sample_k, sample_seed=args.sample_seed, seconds_per_unit=args.seconds_per_unit, start_delay_generator=start_delay_generator)
+                    scale_factor=args.scale, sample_k=args.sample_k, sample_seed=args.sample_seed,
+                    seconds_per_unit=args.seconds_per_unit, start_delay_generator=start_delay_generator,
+                    png_dir=png_dir, frame_total=20)
 
     # floor.visualize(t=5000)
     # call the simulate method to run the actual simulation
@@ -725,6 +785,11 @@ def main():
                    gui=not args.no_graphical_output)
 
     floor.stats()
+    try:
+        _log_file.flush()
+        _log_file.close()
+    except Exception:
+        pass
 
 if __name__ == '__main__':
     main()

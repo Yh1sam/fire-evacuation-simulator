@@ -94,9 +94,10 @@ class MapPainterApp:
         self.start_cell: Optional[Tuple[int, int]] = None
         self.temp_shape = None
         self.ruler_start: Optional[Tuple[int, int]] = None
+        self.room_brush_active: bool = False
 
         # Room 定義：floor_index -> list of rooms
-        # room: {'id': int, 'name': str, 'bbox': (r0,c0,r1,c1)}
+        # room: {'id': str, 'name': str, 'cells': set((r,c), ...)}
         self.rooms: Dict[int, List[Dict]] = {}
         self.next_room_id = 1
         self.room_start_cell: Optional[Tuple[int, int]] = None
@@ -142,7 +143,7 @@ class MapPainterApp:
         # Tools
         ttk.Label(toolbar, text="Tool:").grid(row=1, column=0, sticky='w')
         col = 1
-        for name in ('Brush', 'Line', 'Rect', 'RectO', 'Eraser', 'Ruler'):
+        for name in ('Brush', 'Line', 'Rect', 'RectO', 'Eraser', 'Fill', 'Ruler'):
             ttk.Radiobutton(toolbar, text=name, variable=self.tool, value=name).grid(row=1, column=col)
             col += 1
 
@@ -200,6 +201,8 @@ class MapPainterApp:
         self.canvas.bind("<Button-1>", self.on_down)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_up)
+        # always update ruler on mouse move
+        self.canvas.bind("<Motion>", self.on_move)
 
         # Room list panel
         room_frame = ttk.Frame(center, width=220)
@@ -235,10 +238,13 @@ class MapPainterApp:
     def push_undo(self):
         # deep copy floors and rooms
         floors_snapshot = [fl.clone() for fl in self.floors]
-        rooms_snapshot = {
-            k: [dict(id=r['id'], name=r['name'], bbox=r['bbox']) for r in v]
-            for k, v in self.rooms.items()
-        }
+        rooms_snapshot = {}
+        for k, v in self.rooms.items():
+            copied = []
+            for r in v:
+                cells = set(r.get('cells', set()))
+                copied.append(dict(id=r['id'], name=r['name'], cells=cells))
+            rooms_snapshot[k] = copied
         self.undo_stack.append((floors_snapshot, rooms_snapshot))
         # limit size
         if len(self.undo_stack) > 30:
@@ -249,10 +255,13 @@ class MapPainterApp:
             return
         floors_snapshot, rooms_snapshot = self.undo_stack.pop()
         self.floors = [fl.clone() for fl in floors_snapshot]
-        self.rooms = {
-            k: [dict(id=r['id'], name=r['name'], bbox=r['bbox']) for r in v]
-            for k, v in rooms_snapshot.items()
-        }
+        self.rooms = {}
+        for k, v in rooms_snapshot.items():
+            copied = []
+            for r in v:
+                cells = set(r.get('cells', set()))
+                copied.append(dict(id=r['id'], name=r['name'], cells=cells))
+            self.rooms[k] = copied
         self.redraw()
 
     def on_floor_change(self):
@@ -351,18 +360,17 @@ class MapPainterApp:
                     new_grid.cells[i][j] = fl.cells[i][j]
             new_floors.append(new_grid)
         self.floors = new_floors
-        # clip room bboxes to new size
+        # clip room cells to new size
         for z, rooms in self.rooms.items():
             clipped = []
             for r in rooms:
-                r0, c0, r1, c1 = r['bbox']
-                r0 = max(0, min(rows - 1, r0))
-                r1 = max(0, min(rows - 1, r1))
-                c0 = max(0, min(cols - 1, c0))
-                c1 = max(0, min(cols - 1, c1))
-                if r0 > r1 or c0 > c1:
+                cells = set()
+                for (i, j) in r.get('cells', set()):
+                    if 0 <= i < rows and 0 <= j < cols:
+                        cells.add((i, j))
+                if not cells:
                     continue
-                clipped.append(dict(id=r['id'], name=r['name'], bbox=(r0, c0, r1, c1)))
+                clipped.append(dict(id=r['id'], name=r['name'], cells=cells))
             self.rooms[z] = clipped
         self.refresh_room_list()
         self.redraw()
@@ -373,10 +381,10 @@ class MapPainterApp:
         if idx < 0 or idx >= len(self.floors):
             return
         fl_copy = self.floors[idx].clone()
-        rooms_copy = [
-            dict(id=r['id'], name=r['name'], bbox=r['bbox'])
-            for r in self.rooms.get(idx, [])
-        ]
+        rooms_copy = []
+        for r in self.rooms.get(idx, []):
+            cells = set(r.get('cells', set()))
+            rooms_copy.append(dict(id=r['id'], name=r['name'], cells=cells))
         self.copied_floor = (fl_copy, rooms_copy)
         messagebox.showinfo("Copy Floor", f"Copied Floor {idx+1}")
 
@@ -400,15 +408,14 @@ class MapPainterApp:
         # copy and clip rooms
         clipped_rooms: List[Dict] = []
         for r in rooms_copy:
-            r0, c0, r1, c1 = r['bbox']
-            r0 = max(0, min(rows - 1, r0))
-            r1 = max(0, min(rows - 1, r1))
-            c0 = max(0, min(cols - 1, c0))
-            c1 = max(0, min(cols - 1, c1))
-            if r0 > r1 or c0 > c1:
+            cells = set()
+            for (i, j) in r.get('cells', set()):
+                if 0 <= i < rows and 0 <= j < cols:
+                    cells.add((i, j))
+            if not cells:
                 continue
             clipped_rooms.append(
-                dict(id=r['id'], name=r['name'], bbox=(r0, c0, r1, c1))
+                dict(id=r['id'], name=r['name'], cells=cells)
             )
         self.rooms[idx] = clipped_rooms
         self.refresh_room_list()
@@ -435,6 +442,77 @@ class MapPainterApp:
         for dr in range(-half, -half + size):
             for dc in range(-half, -half + size):
                 self.set_cell(r + dr, c + dc, tok)
+
+    def apply_room_brush(self, r: int, c: int, add: bool):
+        """Modify selected room's cell set with a brush stroke at (r,c)."""
+        fl_index, rooms, idx = self._get_selected_room()
+        if idx is None:
+            return
+        # remove this cell from all rooms on this floor to keep uniqueness
+        for rm in rooms:
+            if 'cells' not in rm:
+                rm['cells'] = set()
+            rm['cells'].discard((r, c))
+        # add to selected room
+        if add:
+            rooms[idx]['cells'].add((r, c))
+        self.rooms[fl_index] = rooms
+
+    def flood_fill(self, r: int, c: int, new_tok: str):
+        """Flood fill contiguous region of same token starting at (r,c)."""
+        fl = self.current_grid()
+        if not (0 <= r < fl.rows and 0 <= c < fl.cols):
+            return
+        old_tok = fl.cells[r][c]
+        if old_tok == new_tok:
+            return
+        R, C = fl.rows, fl.cols
+        stack = [(r, c)]
+        visited = set([(r, c)])
+        while stack:
+            i, j = stack.pop()
+            if fl.cells[i][j] != old_tok:
+                continue
+            fl.cells[i][j] = new_tok
+            for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < R and 0 <= nj < C and (ni, nj) not in visited:
+                    visited.add((ni, nj))
+                    stack.append((ni, nj))
+
+    def room_flood_fill(self, r: int, c: int):
+        """Flood fill region (by map token) and assign all cells to selected room."""
+        fl_index, rooms, idx = self._get_selected_room()
+        if idx is None:
+            return
+        fl = self.current_grid()
+        if not (0 <= r < fl.rows and 0 <= c < fl.cols):
+            return
+        target_tok = fl.cells[r][c]
+        R, C = fl.rows, fl.cols
+        stack = [(r, c)]
+        visited = set([(r, c)])
+        region = set()
+        while stack:
+            i, j = stack.pop()
+            if fl.cells[i][j] != target_tok:
+                continue
+            region.add((i, j))
+            for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < R and 0 <= nj < C and (ni, nj) not in visited:
+                    visited.add((ni, nj))
+                    stack.append((ni, nj))
+        if not region:
+            return
+        # remove region cells from all rooms on this floor, then add to selected room
+        for rm in rooms:
+            if 'cells' not in rm:
+                rm['cells'] = set()
+            rm['cells'] -= region
+        rooms[idx].setdefault('cells', set())
+        rooms[idx]['cells'].update(region)
+        self.rooms[fl_index] = rooms
 
     def draw_line_cells(self, r0, c0, r1, c1, tok):
         # Bresenham
@@ -474,14 +552,26 @@ class MapPainterApp:
     def on_down(self, event):
         r, c = self.cell_from_xy(event.x, event.y)
 
-        # ruler start
-        if self.tool.get() == 'Ruler':
-            self.ruler_start = (r, c)
-            self.update_ruler(r, c)
-            return
+        # ruler start (always track last mousedown)
+        self.ruler_start = (r, c)
+        self.update_ruler(r, c)
 
         # Room 定義模式
         if self.mode.get() == 'room':
+            # room flood-fill: use same region as token fill, but assign to selected room
+            if self.tool.get() == 'Fill' and self.selected_room_index is not None:
+                self.push_undo()
+                self.room_flood_fill(r, c)
+                self.redraw()
+                return
+            # brush / eraser on selected room: paint cells set
+            if self.tool.get() in ('Brush', 'Eraser') and self.selected_room_index is not None:
+                self.push_undo()
+                self.room_brush_active = True
+                self.apply_room_brush(r, c, add=(self.tool.get() == 'Brush'))
+                self.redraw()
+                return
+            # rectangle: new room or edit existing room region
             self.room_start_cell = (r, c)
             cs = self.zoom.get()
             x0, y0 = c * cs, r * cs
@@ -499,15 +589,20 @@ class MapPainterApp:
             self.apply_brush(r, c, tok)
         elif self.tool.get() == 'Eraser':
             self.apply_brush(r, c, 'N')
+        elif self.tool.get() == 'Fill':
+            self.flood_fill(r, c, tok)
+            self.start_cell = None
+            self.redraw()
+            return
         # Line / Rect / RectO 在 drag/up 時處理
         self.redraw()
 
     def on_drag(self, event):
         r, c = self.cell_from_xy(event.x, event.y)
 
-        if self.tool.get() == 'Ruler' and self.ruler_start:
+        # always update ruler while dragging
+        if self.ruler_start is not None:
             self.update_ruler(r, c)
-            return
 
         # continuous brush / eraser while dragging in map mode
         if self.mode.get() == 'map' and self.tool.get() in ('Brush', 'Eraser'):
@@ -517,6 +612,11 @@ class MapPainterApp:
             return
 
         if self.mode.get() == 'room':
+            # continuous room brush / eraser
+            if self.tool.get() in ('Brush', 'Eraser') and self.room_brush_active and self.selected_room_index is not None:
+                self.apply_room_brush(r, c, add=(self.tool.get() == 'Brush'))
+                self.redraw()
+                return
             if self.room_start_cell is None or self.temp_room_rect is None:
                 return
             r0, c0 = self.room_start_cell
@@ -553,8 +653,9 @@ class MapPainterApp:
     def on_up(self, event):
         r, c = self.cell_from_xy(event.x, event.y)
 
-        if self.tool.get() == 'Ruler' and self.ruler_start:
-            # mouse up 不重置，仍然保持 ruler_start
+        if self.mode.get() == 'room' and self.tool.get() in ('Brush', 'Eraser') and self.room_brush_active:
+            # finish room brush editing
+            self.room_brush_active = False
             return
 
         if self.mode.get() == 'room':
@@ -565,11 +666,15 @@ class MapPainterApp:
             rr0, rr1 = sorted((r0, r))
             cc0, cc1 = sorted((c0, c))
             fl_index = self.current_floor.get() - 1
-            # 編輯既有房間：更新 bbox，不改名稱
+            # 編輯既有房間：更新 cells（矩形範圍），不改名稱
             if self.editing_room_index is not None:
                 rooms = self.rooms.get(fl_index, [])
                 if 0 <= self.editing_room_index < len(rooms):
-                    rooms[self.editing_room_index]['bbox'] = (rr0, cc0, rr1, cc1)
+                    cells = set()
+                    for i in range(rr0, rr1 + 1):
+                        for j in range(cc0, cc1 + 1):
+                            cells.add((i, j))
+                    rooms[self.editing_room_index]['cells'] = cells
                     self.rooms[fl_index] = rooms
                 self.editing_room_index = None
             else:
@@ -586,8 +691,12 @@ class MapPainterApp:
                 name = name.strip().replace(" ", "_")
                 rid = str(self.next_room_id)
                 self.next_room_id += 1
+                cells = set()
+                for i in range(rr0, rr1 + 1):
+                    for j in range(cc0, cc1 + 1):
+                        cells.add((i, j))
                 self.rooms.setdefault(fl_index, []).append(
-                    {'id': rid, 'name': name, 'bbox': (rr0, cc0, rr1, cc1)}
+                    {'id': rid, 'name': name, 'cells': cells}
                 )
             # 清掉暫時矩形，由 redraw 畫正式的 overlay
             self.canvas.delete(self.temp_room_rect)
@@ -618,7 +727,7 @@ class MapPainterApp:
 
     # ---------------- ruler ----------------------------------------------
     def update_ruler(self, r: int, c: int):
-        if not self.ruler_start:
+        if self.ruler_start is None:
             self.ruler_label.config(text="Ruler: -")
             return
         r0, c0 = self.ruler_start
@@ -628,7 +737,14 @@ class MapPainterApp:
         self.ruler_label.config(
             text=f"Ruler: from ({r0},{c0}) to ({r},{c})  "
                  f"Δr={dr}, Δc={dc}, d={dist:.2f} m"
+                 f"LENGTHr={(abs(dr)+1)/2}m, LENGTHc={(abs(dc)+1)/2}m"
         )
+
+    def on_move(self, event):
+        """Always update ruler based on current cursor position."""
+        r, c = self.cell_from_xy(event.x, event.y)
+        if self.ruler_start is not None:
+            self.update_ruler(r, c)
 
     # ---------------- redraw ---------------------------------------------
     def redraw(self):
@@ -660,19 +776,28 @@ class MapPainterApp:
         fl_index = self.current_floor.get() - 1
         rooms = self.rooms.get(fl_index, [])
         for idx, room in enumerate(rooms):
-            r0, c0, r1, c1 = room['bbox']
-            x0, y0 = c0 * cs, r0 * cs
-            x1, y1 = (c1 + 1) * cs, (r1 + 1) * cs
+            cells = room.get('cells', set())
+            if not cells:
+                continue
             outline = 'red' if idx == self.selected_room_index else 'gray25'
-            self.canvas.create_rectangle(
-                x0, y0, x1, y1,
-                fill='white',
-                outline=outline,
-                stipple='gray25'
-            )
+            # draw each cell
+            for (r, c) in cells:
+                x0, y0 = c * cs, r * cs
+                x1, y1 = x0 + cs, y0 + cs
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1,
+                    fill='white',
+                    outline=outline,
+                    stipple='gray25'
+                )
+            # label roughly at centroid
+            avg_r = sum(r for (r, _) in cells) / len(cells)
+            avg_c = sum(c for (_, c) in cells) / len(cells)
+            x_text = (avg_c + 0.5) * cs
+            y_text = (avg_r + 0.5) * cs
             self.canvas.create_text(
-                (x0 + x1) / 2,
-                (y0 + y1) / 2,
+                x_text,
+                y_text,
                 text=room['name'],
                 fill='black'
             )
@@ -803,18 +928,19 @@ class MapPainterApp:
             out_path = os.path.join(base_dir, f"floor{idx}.png")
             img.save(out_path, pnginfo=meta)
 
-        # export rooms per floor
+        # export rooms per floor (per-cell list)
         for z, rooms in self.rooms.items():
             if not rooms:
                 continue
             path = os.path.join(base_dir, f"floor{z+1}_rooms.txt")
             with open(path, "w", encoding="utf-8") as f:
-                f.write("# room_id name r0 c0 r1 c1\n")
+                f.write("# room_id name row col\n")
                 for room in rooms:
                     rid = room['id']
                     name = room['name']
-                    r0, c0, r1, c1 = room['bbox']
-                    f.write(f"{rid} {name} {r0} {c0} {r1} {c1}\n")
+                    cells = room.get('cells', set())
+                    for (i, j) in sorted(cells):
+                        f.write(f"{rid} {name} {i} {j}\n")
 
         messagebox.showinfo("Saved", f"Saved to {base_dir}")
 
