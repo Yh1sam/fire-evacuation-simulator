@@ -245,8 +245,8 @@ class Plotter:
 
         self.fig.tight_layout()
         self.fig.canvas.draw_idle()
-        if save_path:
-            self.fig.savefig(save_path, dpi=150)
+        # interactive view only; saved frames are produced by dedicated
+        # off-screen helpers so they are independent of the window size
         plt.pause(delay)
 
     def visualize_multi(
@@ -313,6 +313,96 @@ class Plotter:
 
         self.fig.tight_layout()
         self.fig.canvas.draw_idle()
-        if save_path:
-            self.fig.savefig(save_path, dpi=150)
+        # interactive view only; saved frames are produced by dedicated
+        # off-screen helpers so they are independent of the window size
         plt.pause(delay)
+
+    # ---- off-screen, fixed-size frame saving ---------------------------
+
+    def save_frame_single(self, graph, people, stats, save_path, dpi=150):
+        """
+        Save a single-floor frame to disk using a fixed figure size,
+        independent of the interactive window size.
+        """
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+        fig = Figure(figsize=(6, 6), dpi=dpi)
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(1, 1, 1)
+
+        gdata = self._prepare_grid_data(graph)
+        self.draw_grid(ax, gdata)
+
+        X, Y, C = self._prepare_people_data(people)
+        self.draw_people(ax, X, Y, C)
+
+        title_main = (
+            self._format_stats_title("Floor 1", stats) if stats else "Floor 1"
+        )
+        room_stats = self._compute_room_stats(graph, people)
+        title_rooms = self._format_room_title(room_stats)
+        title = title_main if not title_rooms else f"{title_main}\n{title_rooms}"
+        ax.set_title(title)
+
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=dpi)
+        plt.close(fig)
+
+    def save_frame_multi(
+        self,
+        floor_indices,
+        floor_graphs,
+        floor_people,
+        stats_per_floor,
+        save_path,
+        dpi=150,
+    ):
+        """
+        Save a multi-floor frame to disk using a fixed figure size,
+        independent of the interactive window size.
+        """
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+        n = len(floor_indices)
+        if n == 0:
+            return
+
+        # same layout rule as visualize_multi, but on an off-screen figure
+        ncols = int(math.ceil(math.sqrt(n)))
+        nrows = int(math.ceil(n / ncols))
+
+        # choose a base size per panel to keep scale reasonable
+        fig_width = 4 * ncols
+        fig_height = 4 * nrows
+        fig = Figure(figsize=(fig_width, fig_height), dpi=dpi)
+        canvas = FigureCanvas(fig)
+        axes = fig.subplots(nrows, ncols).ravel()
+
+        for idx, z in enumerate(floor_indices):
+            ax = axes[idx]
+            graph = floor_graphs[idx]
+            people = floor_people[idx]
+
+            gdata = self._prepare_grid_data(graph)
+            self.draw_grid(ax, gdata)
+
+            X, Y, C = self._prepare_people_data(people)
+            self.draw_people(ax, X, Y, C)
+
+            stats = stats_per_floor.get(z, {})
+            title_prefix = f"Floor {z + 1}"
+            title_main = self._format_stats_title(title_prefix, stats)
+            room_stats = self._compute_room_stats(graph, people)
+            title_rooms = self._format_room_title(room_stats)
+            title = title_main if not title_rooms else f"{title_main}\n{title_rooms}"
+            ax.set_title(title)
+
+        # hide any unused axes
+        for j in range(n, axes.size):
+            axes[j].set_visible(False)
+
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=dpi)
+        plt.close(fig)

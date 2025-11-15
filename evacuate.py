@@ -32,6 +32,9 @@ from floorparse import FloorParser
 
 pp = pprint.PrettyPrinter(indent=4).pprint
 
+# logical size of one grid cell (must match editor/parser assumptions)
+CELL_METERS = 0.5
+
 class FireSim:
     sim = None
     graph = None # dictionary (x,y) --> attributes
@@ -326,6 +329,9 @@ class FireSim:
 
         self.r, self.c = r+1, c+1
 
+        # index rooms for quick occupancy / area queries (if room data present)
+        self._build_room_index()
+
         print(
               '='*79,
               'initialized a {}x{} floor with {} people in {} locations'.format(
@@ -367,6 +373,65 @@ class FireSim:
             if not getattr(p, 'alive', True):
                 s['dead'] += 1
         return stats
+
+
+    # --------------- room helpers (occupancy / area) --------------------
+
+    def _build_room_index(self):
+        """
+        Build a mapping (floor_index, room_id) -> set of cell locations.
+        This is used for room occupancy and area statistics.
+        """
+        room_cells = {}
+        for loc, attrs in self.graph.items():
+            rid = attrs.get('room')
+            if not rid:
+                continue
+            # determine floor index
+            if isinstance(loc, tuple) and len(loc) == 3:
+                z = loc[0]
+            else:
+                z = 0
+            key = (z, rid)
+            if key not in room_cells:
+                room_cells[key] = set()
+            room_cells[key].add(loc)
+        self.room_cells = room_cells
+
+    def _ensure_room_index(self):
+        if not hasattr(self, 'room_cells'):
+            self._build_room_index()
+
+    def _room_key_for_loc(self, loc, attrs):
+        """Return (z, room_id, room_name) for a given location, or (None,None,None)."""
+        rid = attrs.get('room')
+        if not rid:
+            return None, None, None
+        if isinstance(loc, tuple) and len(loc) == 3:
+            z = loc[0]
+        else:
+            z = 0
+        name = attrs.get('room_name')
+        return (z, rid, name)
+
+    def _room_stats_at_time(self, room_key):
+        """
+        Given room_key = (z, room_id), compute:
+          - number of agents currently in that room (alive + not safe)
+          - room area in square meters
+        """
+        self._ensure_room_index()
+        cells = self.room_cells.get(room_key)
+        if not cells:
+            return 0, 0.0
+        # count agents currently in any of these cells
+        occ = 0
+        for p in self.people:
+            loc = getattr(p, 'loc', None)
+            if loc in cells and getattr(p, 'alive', True) and not getattr(p, 'safe', False):
+                occ += 1
+        area = len(cells) * (CELL_METERS * CELL_METERS)
+        return occ, area
 
 
     def visualize(self, t):
@@ -430,15 +495,30 @@ class FireSim:
             graphs2d = [floors[z] for z in ordered_floors]
             people2d = [floor_people.get(z, []) for z in ordered_floors]
             stats_per_floor = self.compute_floor_stats()
+
+            # on-screen interactive animation
             self.plotter.visualize_multi(
-                ordered_floors, graphs2d, people2d, stats_per_floor, delay=t, save_path=save_path
+                ordered_floors, graphs2d, people2d, stats_per_floor, delay=t
             )
+            # fixed-size off-screen frame for saving
+            if save_path:
+                self.plotter.save_frame_multi(
+                    ordered_floors, graphs2d, people2d, stats_per_floor, save_path=save_path
+                )
         else:
             # single-layer: behave as before but include global stats
             graph2d = self.graph
             people2d = self.people
             stats = self.compute_floor_stats()
-            self.plotter.visualize(graph2d, people2d, t, stats=stats.get(0), save_path=save_path)
+            stats0 = stats.get(0)
+
+            # on-screen interactive animation
+            self.plotter.visualize(graph2d, people2d, t, stats=stats0)
+            # fixed-size off-screen frame for saving
+            if save_path:
+                self.plotter.save_frame_single(
+                    graph2d, people2d, stats0, save_path=save_path
+                )
     def update_bottlenecks(self):
         '''
         handles the bottleneck zones on the grid, where people cannot all pass
@@ -530,8 +610,8 @@ class FireSim:
             self.numdead += 1
             if self.verbose:
                 print('{:>6.2f}\tPerson {:>3} at {} could not make it'.format(
-                                                                  self.sim.now,
-                                                                  p.id, p.loc))
+                                                                      self.sim.now,
+                                                                      p.id, p.loc))
             return
         if p.safe:
             self.numsafe += 1
@@ -540,12 +620,20 @@ class FireSim:
             self.avg_exit += p.exit_time
             if self.verbose:
                 print('{:>6.2f}\tPerson {:>3} is now SAFE!'.format(self.sim.now, 
-                                                               p.id))
+                                                                   p.id))
             return
 
         loc = p.loc
         square = self.graph[loc]
         nbrs = [(coords, self.graph[coords]) for coords in square['nbrs']]
+
+        # track room before movement (if any), so we can log when agent leaves it
+        z_old, room_id_old, room_name_old = self._room_key_for_loc(loc, square)
+        occ_before = None
+        area_m2 = None
+        if room_id_old is not None:
+            room_key = (z_old, room_id_old)
+            occ_before, area_m2 = self._room_stats_at_time(room_key)
 
         target = p.move(nbrs)
         if not target:
@@ -553,10 +641,25 @@ class FireSim:
             self.numdead += 1
             if self.verbose:
                 print('{:>6.2f}\tPerson {:>3} at {} got trapped in fire'.format(
-                                                                   self.sim.now,
-                                                                   p.id, p.loc))
+                                                                       self.sim.now,
+                                                                       p.id, p.loc))
             return
         square = self.graph[target]
+
+        # if the agent just left a room, log the event with occupancy and area
+        if room_id_old is not None:
+            z_new, room_id_new, _ = self._room_key_for_loc(target, square)
+            if room_id_new != room_id_old:
+                # use occ_before (includes this agent at the moment of leaving)
+                if occ_before is not None and area_m2 is not None:
+                    t_sec = float(self.sim.now) * getattr(self, 'seconds_per_unit', 1.0)
+                    print(
+                        'ROOM-EXIT\t t={:>8.3f} s\t person {:>4} left room {} ({}) '
+                        'occ={} area={:.2f} m^2'.format(
+                            t_sec, p.id, room_id_old, room_name_old or '',
+                            occ_before, area_m2
+                        )
+                    )
         if square['B']:
             b = self.bottlenecks[target]
             b.enterBottleNeck(p)
