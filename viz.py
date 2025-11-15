@@ -161,6 +161,44 @@ class Plotter:
             C.append(c)
         return X, Y, C
 
+    def _compute_room_stats(self, graph, people):
+        """
+        Compute per-room stats for a single 2D graph.
+        Returns dict room_id -> {'total':.., 'safe':.., 'dead':..}
+        """
+        from collections import defaultdict
+        stats = defaultdict(lambda: {"total": 0, "safe": 0, "dead": 0})
+        for p in people:
+            loc = getattr(p, "loc", None)
+            if not isinstance(loc, tuple) or len(loc) != 2:
+                continue
+            key = (loc[0], loc[1])
+            attrs = graph.get(key)
+            if not attrs:
+                continue
+            rid = attrs.get("room")
+            if rid is None:
+                continue
+            s = stats[rid]
+            s["total"] += 1
+            if getattr(p, "safe", False):
+                s["safe"] += 1
+            if not getattr(p, "alive", True):
+                s["dead"] += 1
+        return stats
+
+    def _format_room_title(self, room_stats):
+        """Format per-room stats into a short title line."""
+        if not room_stats:
+            return ""
+        parts = []
+        for rid in sorted(room_stats.keys(), key=lambda x: str(x)):
+            s = room_stats[rid]
+            parts.append(
+                f"{rid}:T={s.get('total',0)}/S={s.get('safe',0)}/D={s.get('dead',0)}"
+            )
+        return "Rooms: " + "  ".join(parts)
+
     def _format_stats_title(self, prefix, stats):
         if not stats:
             return prefix or ""
@@ -195,7 +233,14 @@ class Plotter:
         X, Y, C = self._prepare_people_data(people)
         self.draw_people(ax, X, Y, C)
 
-        title = self._format_stats_title("Floor 1", stats) if stats else "Floor 1"
+        # floor-level stats line
+        title_main = (
+            self._format_stats_title("Floor 1", stats) if stats else "Floor 1"
+        )
+        # per-room stats line (if any rooms are defined)
+        room_stats = self._compute_room_stats(graph, people)
+        title_rooms = self._format_room_title(room_stats)
+        title = title_main if not title_rooms else f"{title_main}\n{title_rooms}"
         ax.set_title(title)
 
         self.fig.tight_layout()
@@ -252,7 +297,12 @@ class Plotter:
 
             stats = stats_per_floor.get(z, {})
             title_prefix = f"Floor {z + 1}"
-            ax.set_title(self._format_stats_title(title_prefix, stats))
+            title_main = self._format_stats_title(title_prefix, stats)
+            # per-room stats for this floor
+            room_stats = self._compute_room_stats(graph, people)
+            title_rooms = self._format_room_title(room_stats)
+            title = title_main if not title_rooms else f"{title_main}\n{title_rooms}"
+            ax.set_title(title)
 
         # hide any unused axes
         for j in range(n, axes.size):

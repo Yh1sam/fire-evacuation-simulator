@@ -344,6 +344,40 @@ class FloorParser:
                     for i in range(R)]
             floors[z] = grid
 
+        # helper: load room definitions per floor
+        def _load_rooms_for_floor(folder_path, floor_index):
+            """
+            Expect optional text file floor{floor_index+1}_rooms.txt with lines:
+            room_id name r0 c0 r1 c1
+            name should be a single token (no spaces); if spaces are needed,
+            they can be encoded with underscores.
+            """
+            import os as _os
+            rooms = []
+            fname = _os.path.join(folder_path, f"floor{floor_index+1}_rooms.txt")
+            if not _os.path.exists(fname):
+                return rooms
+            try:
+                with open(fname, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split()
+                        if len(parts) < 6:
+                            continue
+                        rid = parts[0]
+                        name = parts[1]
+                        try:
+                            r0 = int(parts[2]); c0 = int(parts[3])
+                            r1 = int(parts[4]); c1 = int(parts[5])
+                        except ValueError:
+                            continue
+                        rooms.append((rid, name, r0, c0, r1, c1))
+            except Exception:
+                return rooms
+            return rooms
+
         # second pass: build multi-floor graph
         graph = defaultdict(lambda: {'nbrs': set()})
         Z = len(floors)
@@ -382,6 +416,23 @@ class FloorParser:
                         tgt = (z+1, i, j)
                         graph[key]['nbrs'].add(tgt)
                         graph[tgt]['nbrs'].add(key)
+
+        # third pass: assign room ids/names from optional room definition files
+        for z in floors.keys():
+            rooms = _load_rooms_for_floor(folder, z)
+            if not rooms:
+                continue
+            for rid, name, r0, c0, r1, c1 in rooms:
+                rr0, rr1 = sorted((r0, r1))
+                cc0, cc1 = sorted((c0, c1))
+                for i in range(rr0, rr1+1):
+                    for j in range(cc0, cc1+1):
+                        key = (z, i, j)
+                        if key not in graph:
+                            continue
+                        attrs = graph[key]
+                        attrs['room'] = rid
+                        attrs['room_name'] = name
 
         self.graph = dict(graph.items())
         return self.graph
