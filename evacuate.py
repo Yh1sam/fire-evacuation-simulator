@@ -70,16 +70,27 @@ class FireSim:
         self.verbose = verbose
 
         import os
-        ext = os.path.splitext(input)[1].lower()
-        if ext in ('.png', '.jpg', '.jpeg'):
+        # allow three kinds of inputs:
+        #  1) directory containing floorX.png --> multi-floor graph with (z,i,j) keys
+        #  2) single PNG/JPG path --> single-layer graph from parse_image
+        #  3) text file --> original parser
+        if os.path.isdir(input):
             try:
-                self.graph = self.parser.parse_image(input)
+                self.graph = self.parser.parse_image_folder(input)
             except Exception as e:
-                print('ERR reading image:', e)
+                print('ERR reading image folder:', e)
                 raise
         else:
-            with open(input, 'r') as f:
-                self.graph = self.parser.parse(f.read())
+            ext = os.path.splitext(input)[1].lower()
+            if ext in ('.png', '.jpg', '.jpeg'):
+                try:
+                    self.graph = self.parser.parse_image(input)
+                except Exception as e:
+                    print('ERR reading image:', e)
+                    raise
+            else:
+                with open(input, 'r') as f:
+                    self.graph = self.parser.parse(f.read())
         self.numpeople = n
 
         self.location_sampler = location_sampler
@@ -171,6 +182,11 @@ class FireSim:
         if s <= 1:
             return
         graph = self.graph
+        # do not scale multi-layer graphs (keys like (z,i,j))
+        if graph:
+            sample_key = next(iter(graph))
+            if isinstance(sample_key, tuple) and len(sample_key) == 3:
+                return
         # dimensions
         R = max(i for i,j in graph.keys()) + 1
         C = max(j for i,j in graph.keys()) + 1
@@ -311,51 +327,96 @@ class FireSim:
              )
 
 
+    def compute_floor_stats(self):
+        '''
+        Compute simple per-floor statistics for visualization.
+        Returns dict: floor_index -> {'total':..., 'safe':..., 'dead':...}
+        '''
+        from collections import defaultdict
+        stats = defaultdict(lambda: {'total': 0, 'safe': 0, 'dead': 0})
+        for p in self.people:
+            loc = getattr(p, 'loc', None)
+            if loc is None:
+                continue
+            # map location to floor index
+            if isinstance(loc, tuple):
+                if len(loc) == 3:
+                    z = loc[0]
+                elif len(loc) == 2:
+                    z = 0
+                else:
+                    continue
+            else:
+                # unknown location format, treat as floor 0
+                z = 0
+            s = stats[z]
+            s['total'] += 1
+            if getattr(p, 'safe', False):
+                s['safe'] += 1
+            if not getattr(p, 'alive', True):
+                s['dead'] += 1
+        return stats
+
+
     def visualize(self, t):
         '''
         '''
         if not self.gui:
             return
-        # Adapt multi-layer graphs to 2D slice for visualization
         sample_key = next(iter(self.graph))
-        graph2d = None
-        people2d = None
+        # multi-layer: visualize all floors side-by-side with per-floor stats
         if isinstance(sample_key, tuple) and len(sample_key) == 3:
-            layer = getattr(self, 'viz_layer', 0)
-            graph2d = {}
-            # build 2D graph for the chosen layer
+            # build per-floor 2D graphs
+            floors = {}
             for key, attrs in self.graph.items():
                 if not (isinstance(key, tuple) and len(key) == 3):
                     continue
                 z, i, j = key
-                if z != layer:
-                    continue
+                fl = floors.setdefault(z, {})
                 new_attrs = {k: v for k, v in attrs.items() if k != 'nbrs'}
                 nbrs2d = set()
-                for n in attrs['nbrs']:
+                for n in attrs.get('nbrs', []):
                     if isinstance(n, tuple) and len(n) == 3:
                         zz, ii, jj = n
-                        if zz == layer:
+                        if zz == z:
                             nbrs2d.add((ii, jj))
                     elif isinstance(n, tuple) and len(n) == 2:
                         nbrs2d.add(n)
                 new_attrs['nbrs'] = nbrs2d
-                graph2d[(i, j)] = new_attrs
-            # project people on that layer
+                fl[(i, j)] = new_attrs
+
+            # project people per floor
             from types import SimpleNamespace as NS
-            people2d = []
+            floor_people = {z: [] for z in floors}
             for p in self.people:
-                if isinstance(p.loc, tuple) and len(p.loc) == 3:
-                    z, i, j = p.loc
-                    if z != layer:
-                        continue
-                    people2d.append(NS(id=p.id, loc=(i, j), safe=p.safe, alive=p.alive))
-                else:
-                    people2d.append(NS(id=p.id, loc=p.loc, safe=p.safe, alive=p.alive))
+                loc = getattr(p, 'loc', None)
+                if isinstance(loc, tuple) and len(loc) == 3:
+                    z, i, j = loc
+                    if z in floor_people:
+                        floor_people[z].append(
+                            NS(id=p.id, loc=(i, j), safe=getattr(p, 'safe', False),
+                               alive=getattr(p, 'alive', True))
+                        )
+                elif isinstance(loc, tuple) and len(loc) == 2:
+                    # treat 2D locations as floor 0
+                    floor_people.setdefault(0, []).append(
+                        NS(id=p.id, loc=loc, safe=getattr(p, 'safe', False),
+                           alive=getattr(p, 'alive', True))
+                    )
+
+            ordered_floors = sorted(floors.keys())
+            graphs2d = [floors[z] for z in ordered_floors]
+            people2d = [floor_people.get(z, []) for z in ordered_floors]
+            stats_per_floor = self.compute_floor_stats()
+            self.plotter.visualize_multi(
+                ordered_floors, graphs2d, people2d, stats_per_floor, delay=t
+            )
         else:
+            # single-layer: behave as before but include global stats
             graph2d = self.graph
             people2d = self.people
-        self.plotter.visualize(graph2d, people2d, t)
+            stats = self.compute_floor_stats()
+            self.plotter.visualize(graph2d, people2d, t, stats=stats.get(0))
     def update_bottlenecks(self):
         '''
         handles the bottleneck zones on the grid, where people cannot all pass

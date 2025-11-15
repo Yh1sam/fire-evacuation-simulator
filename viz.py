@@ -1,138 +1,263 @@
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
-from matplotlib import colors, colorbar
-import numpy as np
+import math
 from random import Random
+
+import matplotlib.colors as colors
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 class Plotter:
+    """
+    Simple matplotlib-based grid visualizer.
+
+    - Single-floor: one panel, same behaviour as original project.
+    - Multi-floor: multiple panels shown at the same time (one per floor),
+      with per-floor stats in the title.
+    """
 
     def __init__(self):
-        '''
-        '''
         plt.ion()
+        self.fig = None
+        self.axes = None
 
-    def draw_grid(self, gdata):
-        '''
-        '''
-        r, c = len(gdata), len(gdata[0])
+    # ---- low-level drawing helpers -------------------------------------
 
-        # create discrete colormap
-        cmap = colors.ListedColormap(['lightblue', 'black', 'red',
-                                      'lightgreen', 'darkblue', '#520000'])
-        bounds = [-.5, .5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    def _ensure_figure(self, n_axes):
+        """Create or resize the figure to have at least n_axes axes."""
+        if self.fig is None or self.axes is None:
+            self.fig, self.axes = plt.subplots(1, n_axes, squeeze=False)
+        else:
+            # flatten existing axes and resize if needed
+            flat = self.axes.ravel()
+            if flat.size < n_axes:
+                plt.close(self.fig)
+                self.fig, self.axes = plt.subplots(1, n_axes, squeeze=False)
+        return self.axes.ravel()
+
+    def draw_grid(self, ax, gdata):
+        """
+        Draw the background grid (walls, fire, exits, bottlenecks, stairs).
+
+        Values in gdata:
+          0: normal / empty
+          1: wall
+          2: fire
+          3: safe
+          4: bottleneck / door
+          5: wall + fire
+          6: stairs-down area (SD)
+          7: stairs-up area (SU)
+          8: teleport-down cell (TD)
+          9: teleport-up cell (TU)
+        """
+        cmap = colors.ListedColormap(
+            [
+                "#BFE3F0",  # 0 normal
+                "#000000",  # 1 wall
+                "#D9534F",  # 2 fire
+                "#5CB85C",  # 3 safe
+                "#213B8F",  # 4 bottleneck
+                "#800000",  # 5 burning wall
+                "#7f3b08",  # 6 stairs down area
+                "#b35806",  # 7 stairs up area
+                "#01665e",  # 8 teleport down
+                "#35978f",  # 9 teleport up
+            ]
+        )
+        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5]
         norm = colors.BoundaryNorm(bounds, cmap.N)
 
-        plt.imshow(gdata, cmap=cmap, norm=norm)
+        r, c = gdata.shape
+        ax.imshow(
+            gdata,
+            cmap=cmap,
+            norm=norm,
+            origin="upper",
+            interpolation="nearest",
+            extent=(-0.5, c - 0.5, r - 0.5, -0.5),
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-        # draw gridlines
-        plt.grid(which='major', axis='both', linestyle='-', color='k', linewidth=2)
-        plt.xticks(np.arange(-.5, r, 1))
-        plt.yticks(np.arange(-.5, c, 1))
-        plt.axis('off')
+    def draw_people(self, ax, X, Y, C):
+        """
+        Draw people on top of the grid.
 
-
-    def draw_people(self, x=[], y=[], c=[]):
-        '''
-        '''
-        #                               alive      ded    safe    unknown
-        cmap = colors.ListedColormap(['blue', '#2b0000', 'darkgreen', 'yellow'])
-        bounds = [-.5, .5, 1.5, 2.5, 3.5]
+        C values:
+          0: moving / alive
+          1: dead
+          2: safe
+          3: unknown
+        """
+        if not X:
+            return
+        cmap = colors.ListedColormap(
+            [
+                "#377eb8",  # alive
+                "#000000",  # dead
+                "#4daf4a",  # safe
+                "#ff7f00",  # unknown
+            ]
+        )
+        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
         norm = colors.BoundaryNorm(bounds, cmap.N)
+        ax.scatter(X, Y, c=C, cmap=cmap, norm=norm, s=10)
 
-        plt.scatter(x, y, c=c, cmap=cmap, norm=norm)
-
-
-    def visualize(self, graph={(3,4): {'F': 1}}, people=[], delay=.01):
-        '''
-        '''
-
-        # an arbitrary assignment of integers for each of the attributes for our
-        # colormap
-        attrmap = {'N': 0, 'W': 1, 'F': 2, 'S': 3, 'B': 4}
-
-        # detect rows and columns
+    def _prepare_grid_data(self, graph):
+        """Convert graph dict into a 2D numpy array of attribute codes."""
         r, c = 0, 0
         for loc, attrs in graph.items():
-            r = max(r, loc[0]+1)
-            c = max(c, loc[1]+1)
+            r = max(r, loc[0] + 1)
+            c = max(c, loc[1] + 1)
+        if r == 0 or c == 0:
+            return np.zeros((1, 1))
 
-        # start with a blank grid and fill into attributes
-        gdata = np.zeros(shape=(r, c))
-
+        gdata = np.zeros((r, c))
         for loc, attrs in graph.items():
-            for att in 'SWBF':
-                if att not in attrs: continue
-                if attrs[att]:
-                    gdata[loc] = attrmap[att]
-                    if att == 'W' and attrs['F']:
-                        gdata[loc] = 5
-                    break
+            code = 0
+            # wall (possibly burning) has highest priority
+            if attrs.get("W"):
+                code = 5 if attrs.get("F") else 1
+            elif attrs.get("F"):
+                code = 2
+            elif attrs.get("S"):
+                code = 3
+            elif attrs.get("B"):
+                code = 4
+            elif attrs.get("SD"):
+                code = 6
+            elif attrs.get("SU"):
+                code = 7
+            elif attrs.get("TD"):
+                code = 8
+            elif attrs.get("TU"):
+                code = 9
+            else:
+                code = 0
+            gdata[loc] = code
+        return gdata
 
-        # use the accumulated data to draw the grid
-        self.draw_grid(gdata)
-
+    def _prepare_people_data(self, people):
+        """Convert people sequence into scatter plot data."""
         X, Y, C = [], [], []
         for p in people:
-            row, col = p.loc
-            R = Random(p.id)
-            x, y = col-.5 + R.random(), row-.5 + R.random()
-            if p.safe: c = 2
-            elif not p.alive: c = 1
-            elif p.alive: c = 0
-            else: c = 3 # unknown state??
+            loc = getattr(p, "loc", None)
+            if not isinstance(loc, tuple) or len(loc) != 2:
+                continue
+            row, col = loc
+            R = Random(getattr(p, "id", 0))
+            x = col - 0.5 + R.random()
+            y = row - 0.5 + R.random()
+            if getattr(p, "safe", False):
+                c = 2
+            elif not getattr(p, "alive", True):
+                c = 1
+            elif getattr(p, "alive", True):
+                c = 0
+            else:
+                c = 3
+            X.append(x)
+            Y.append(y)
+            C.append(c)
+        return X, Y, C
 
-            X += [x]
-            Y += [y]
-            C += [c]
+    def _format_stats_title(self, prefix, stats):
+        if not stats:
+            return prefix or ""
+        parts = []
+        if prefix:
+            parts.append(prefix)
+        parts.append(f"total={stats.get('total', 0)}")
+        parts.append(f"safe={stats.get('safe', 0)}")
+        parts.append(f"dead={stats.get('dead', 0)}")
+        return "  ".join(parts)
 
-        self.draw_people(X, Y, C)
+    # ---- public API -----------------------------------------------------
 
-        # matplotlib housekeeping
-        plt.draw()
+    def visualize(self, graph={(3, 4): {"F": 1}}, people=None, delay=0.01, stats=None):
+        """
+        Visualize a single-floor map.
+
+        graph: dict[(i,j)] -> attrs
+        people: iterable of objects with at least .loc, .safe, .alive, .id
+        stats: optional dict with keys total/safe/dead for title annotation
+        """
+        if people is None:
+            people = []
+
+        axes = self._ensure_figure(1)
+        ax = axes[0]
+        ax.clear()
+
+        gdata = self._prepare_grid_data(graph)
+        self.draw_grid(ax, gdata)
+
+        X, Y, C = self._prepare_people_data(people)
+        self.draw_people(ax, X, Y, C)
+
+        title = self._format_stats_title("Floor 1", stats) if stats else "Floor 1"
+        ax.set_title(title)
+
+        self.fig.tight_layout()
+        self.fig.canvas.draw_idle()
         plt.pause(delay)
-        plt.clf()
 
+    def visualize_multi(
+        self,
+        floor_indices,
+        floor_graphs,
+        floor_people,
+        stats_per_floor,
+        delay=0.01,
+    ):
+        """
+        Visualize multiple floors side-by-side.
 
+        floor_indices: list of floor indices (z)
+        floor_graphs:  list of per-floor 2D graphs (same format as visualize)
+        floor_people:  list of per-floor people lists (loc is 2D)
+        stats_per_floor: dict z -> stats dict (total/safe/dead)
+        """
+        n = len(floor_indices)
+        if n == 0:
+            return
 
+        # arrange subplots in roughly square grid
+        ncols = int(math.ceil(math.sqrt(n)))
+        nrows = int(math.ceil(n / ncols))
 
-for i in range(10):
-    break
-    x = np.random.random([2, 10])
-    print(x)
-    plt.scatter(*x)
+        # create figure only once; reuse between frames so we don't keep
+        # popping new windows for every animation step
+        if self.fig is None or self.axes is None:
+            self.fig, self.axes = plt.subplots(nrows, ncols, squeeze=False)
+        else:
+            # if layout changed (different number of floors), recreate
+            existing_nrows, existing_ncols = self.axes.shape
+            if existing_nrows != nrows or existing_ncols != ncols:
+                plt.close(self.fig)
+                self.fig, self.axes = plt.subplots(nrows, ncols, squeeze=False)
+        axes = self.axes.ravel()
 
-    plt.draw()
-    plt.pause(0.0001)
+        for idx, z in enumerate(floor_indices):
+            ax = axes[idx]
+            ax.clear()
 
-    plt.clf()
+            graph = floor_graphs[idx]
+            people = floor_people[idx]
+            gdata = self._prepare_grid_data(graph)
+            self.draw_grid(ax, gdata)
 
+            X, Y, C = self._prepare_people_data(people)
+            self.draw_people(ax, X, Y, C)
 
+            stats = stats_per_floor.get(z, {})
+            title_prefix = f"Floor {z + 1}"
+            ax.set_title(self._format_stats_title(title_prefix, stats))
 
+        # hide any unused axes
+        for j in range(n, axes.size):
+            axes[j].set_visible(False)
 
-if __name__ == '__main__':
-    grid = Plotter()
-    grid.visualize()
-
-    raise
-    # create discrete colormap
-    cmap = colors.ListedColormap(['red', 'blue'])
-    bounds = range()
-    norm = colors.BoundaryNorm(bounds, cmap.N)
-
-    for i in range(50):
-
-        data = np.zeros(shape=(10, 10))# * 20
-
-        #fig, ax = plt.subplots()
-        plt.imshow(data, cmap=cmap, norm=norm)
-
-        # draw gridlines
-        plt.grid(which='major', axis='both', linestyle='-', color='k', linewidth=2)
-        plt.xticks(np.arange(-.5, 10, 1));
-        plt.yticks(np.arange(-.5, 10, 1));
-
-        plt.draw()
-        plt.pause(.0001)
-
-        plt.clf()
+        self.fig.tight_layout()
+        self.fig.canvas.draw_idle()
+        plt.pause(delay)

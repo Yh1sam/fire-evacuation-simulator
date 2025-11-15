@@ -8,13 +8,16 @@ Multi-floor, cell-based map editor for the evacuation simulator.
   (pixels per cell) so you can freely zoom the canvas without changing
   the underlying map.
 - Tokens (per cell):
-    W = wall
-    N = walkable (normal)
-    S = safe / exit
-    B = bottleneck / door
-    F = fire
-    P = spawn point
-    Z = stairs / vertical connector between floors
+    W  = wall
+    N  = walkable (normal)
+    S  = safe / exit
+    B  = bottleneck / door
+    F  = fire
+    P  = spawn point
+    SD = stairs down area      (this floor's down-stair space)
+    SU = stairs up area        (this floor's up-stair space)
+    TD = teleport down trigger (step here -> go to lower floor)
+    TU = teleport up trigger   (step here -> go to upper floor)
 - Tools:
     Brush, Line, Rect, Eraser ? all operate at cell granularity. A cell is
     either filled with a token or set to N; no half-cells.
@@ -38,15 +41,19 @@ from PIL import Image, ImageTk
 from PIL.PngImagePlugin import PngInfo
 
 CELL_METERS = 0.5  # each cell is 0.5m x 0.5m
-TOKENS = ['W','N','S','B','F','P','Z']
+# logical token set used by the editor
+TOKENS = ['W','N','S','B','F','P','SD','SU','TD','TU']
 PALETTE = {
-    'W': '#000000',     # wall
-    'N': '#BFE3F0',     # walkable
-    'S': '#5CB85C',     # safe
-    'B': '#213B8F',     # bottleneck / door
-    'F': '#D9534F',     # fire
-    'P': '#5BC0DE',     # spawn
-    'Z': '#990099',     # stairs / connector
+    'W':  '#000000',   # wall
+    'N':  '#BFE3F0',   # walkable
+    'S':  '#5CB85C',   # safe
+    'B':  '#213B8F',   # bottleneck / door
+    'F':  '#D9534F',   # fire
+    'P':  '#5BC0DE',   # spawn
+    'SD': '#7f3b08',   # stairs down area
+    'SU': '#b35806',   # stairs up area
+    'TD': '#01665e',   # teleport down
+    'TU': '#35978f',   # teleport up
 }
 
 @dataclass

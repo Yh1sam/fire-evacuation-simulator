@@ -136,34 +136,46 @@ class FloorParser:
                     s += '{:>4}'.format(att)
                 s += '\n'
             return s
+
     def parse_image(self, path, palette=None):
         '''
         Parse a PNG/JPG image as a single-layer grid.
-        Each pixel is treated as one cell (0.5m x 0.5m in your physical model).
-        Colors are mapped to tokens W/N/S/B/F/P/Z by nearest color distance.
-        If PNG has a 'map_meta' text chunk with cell_px>1, we average blocks of
-        that many pixels per cell instead.
+        Each pixel is treated as one logical cell (0.5m x 0.5m in our model).
+        Colors are mapped to tokens by nearest color distance.
+
+        Supported tokens (by color):
+          W,N,S,B,F,P as usual, and stairs-related tokens:
+          SD = stairs down area, SU = stairs up area,
+          TD = teleport down,  TU = teleport up.
+
+        Stairs tokens are exposed as boolean attributes SD/SU/TD/TU on each
+        cell, in addition to the standard WSBFNP flags.
         '''
         try:
             from PIL import Image
         except Exception as e:
             raise RuntimeError('Pillow is required to read PNG maps: '+str(e))
-        DEFAULT_PAL = {
 
-            'W': (0, 0, 0),
-            'N': (191, 227, 240),
-            'S': (92, 184, 92),
-            'B': (33, 59, 143),
-            'F': (217, 83, 79),
-            'P': (91, 192, 222),
-            'Z': (153, 0, 153),
+        DEFAULT_PAL = {
+            'W':  (0, 0, 0),
+            'N':  (191, 227, 240),
+            'S':  (92, 184, 92),
+            'B':  (33, 59, 143),
+            'F':  (217, 83, 79),
+            'P':  (91, 192, 222),
+            'SD': (127, 59, 8),
+            'SU': (179, 88, 6),
+            'TD': (1, 102, 94),
+            'TU': (53, 151, 143),
         }
+        pal = dict(DEFAULT_PAL)
         if palette:
             pal.update(palette)
+
         img = Image.open(path).convert('RGB')
         W, H = img.size
         cell_px = 1
-        # optional metadata
+        # optional metadata (allows grouping pixels into larger cells)
         meta = getattr(img, "text", {}) or getattr(img, "info", {})
         if 'map_meta' in meta:
             try:
@@ -181,6 +193,7 @@ class FloorParser:
             cell_px = g
         R, C = H//cell_px, W//cell_px
         px = img.load()
+
         def block_avg(i,j):
             rs=gs=bs=0; cnt=0
             for di in range(cell_px):
@@ -188,24 +201,187 @@ class FloorParser:
                     r,g,b = px[j*cell_px+dj, i*cell_px+di]
                     rs+=r; gs+=g; bs+=b; cnt+=1
             return (rs//cnt, gs//cnt, bs//cnt)
+
         def nearest_token(rgb):
             r,g,b = rgb; best="N"; bestd=10**12
             for t,(Rr,Gg,Bb) in pal.items():
-                d=(r-Rr)*(r-Rr)+(g-Gg)*(g-Gg)+(b-Bb)*(b-Bb)
-                if d<bestd: bestd=d; best=t
+                d = (r-Rr)*(r-Rr) + (g-Gg)*(g-Gg) + (b-Bb)*(b-Bb)
+                if d < bestd:
+                    bestd, best = d, t
             return best
-        from collections import defaultdict
+
         graph = defaultdict(lambda: {'nbrs': set()})
         for i in range(R):
             for j in range(C):
                 tok = nearest_token(block_avg(i,j))
-                for att in "WSBFNPZ":
-                    graph[(i,j)][att] = int(att == tok)
+                attrs = graph[(i,j)]
+                # standard flags
+                for att in "WSBFNP":
+                    attrs[att] = int(att == tok)
+                # stairs-related flags; keep them as extra booleans
+                for att in ("SD","SU","TD","TU"):
+                    attrs[att] = int(att == tok)
+        # neighbors (4-connected)
         for i in range(R):
             for j in range(C):
                 for di,dj in ((-1,0),(1,0),(0,-1),(0,1)):
                     i2, j2 = i+di, j+dj
                     if 0 <= i2 < R and 0 <= j2 < C:
                         graph[(i,j)]['nbrs'].add((i2,j2))
+        self.graph = dict(graph.items())
+        return self.graph
+
+    def parse_image_folder(self, folder, palette=None):
+        '''
+        Parse all floor*.png images in a folder as a multi-floor grid.
+        Returns a graph with keys (z,i,j):
+          z = floor index (0-based, ordered by floor_index metadata or filename)
+          i,j = row, col within that floor.
+
+        Stairs-related tokens use the SD/SU/TD/TU attributes per cell.
+        Vertical connectivity:
+          - TD at floor z connects to cell at same (i,j) on floor z-1 (if exists)
+          - TU at floor z connects to cell at same (i,j) on floor z+1 (if exists)
+        Edges are undirected (added in both directions).
+        '''
+        import os
+        try:
+            from PIL import Image
+        except Exception as e:
+            raise RuntimeError('Pillow is required to read PNG maps: '+str(e))
+
+        # discover floor images
+        files = []
+        for name in os.listdir(folder):
+            if name.lower().endswith('.png'):
+                files.append(os.path.join(folder, name))
+        if not files:
+            raise FileNotFoundError(f'No PNG floors found in folder: {folder}')
+
+        # helper to extract floor index from metadata / filename
+        def floor_index_for(path):
+            idx = None
+            try:
+                img = Image.open(path)
+                meta = getattr(img, "text", {}) or getattr(img, "info", {})
+                if 'map_meta' in meta:
+                    import json as _json
+                    m = _json.loads(meta['map_meta'])
+                    idx = int(m.get('floor_index', 0))
+            except Exception:
+                idx = None
+            if idx is not None:
+                return idx
+            # fallback: parse floorN from filename
+            base = os.path.basename(path)
+            m = re.search(r'floor(\\d+)', base, flags=re.I)
+            if m:
+                return int(m.group(1))
+            return 0
+
+        files_sorted = sorted(files, key=floor_index_for)
+        # reindex floors as 0..Z-1
+        floor_paths = [(z, p) for z, p in enumerate(files_sorted)]
+
+        # colour palette consistent with parse_image
+        DEFAULT_PAL = {
+            'W':  (0, 0, 0),
+            'N':  (191, 227, 240),
+            'S':  (92, 184, 92),
+            'B':  (33, 59, 143),
+            'F':  (217, 83, 79),
+            'P':  (91, 192, 222),
+            'SD': (127, 59, 8),
+            'SU': (179, 88, 6),
+            'TD': (1, 102, 94),
+            'TU': (53, 151, 143),
+        }
+        pal = dict(DEFAULT_PAL)
+        if palette:
+            pal.update(palette)
+
+        # first pass: read token grids per floor
+        floors = {}
+        for z, path in floor_paths:
+            img = Image.open(path).convert('RGB')
+            W, H = img.size
+            cell_px = 1
+            meta = getattr(img, "text", {}) or getattr(img, "info", {})
+            if 'map_meta' in meta:
+                try:
+                    import json as _json
+                    m = _json.loads(meta['map_meta'])
+                    if 'cell_px' in m:
+                        cell_px = max(1, int(m['cell_px']))
+                    elif 'tile_px' in m:
+                        cell_px = max(1, int(m['tile_px']))
+                except Exception:
+                    cell_px = 1
+            from math import gcd
+            if (W % cell_px != 0) or (H % cell_px != 0):
+                g = gcd(W, H) or 1
+                cell_px = g
+            R, C = H//cell_px, W//cell_px
+            px = img.load()
+
+            def block_avg(i,j):
+                rs=gs=bs=0; cnt=0
+                for di in range(cell_px):
+                    for dj in range(cell_px):
+                        r,g,b = px[j*cell_px+dj, i*cell_px+di]
+                        rs+=r; gs+=g; bs+=b; cnt+=1
+                return (rs//cnt, gs//cnt, bs//cnt)
+
+            def nearest_token(rgb):
+                r,g,b = rgb; best="N"; bestd=10**12
+                for t,(Rr,Gg,Bb) in pal.items():
+                    d = (r-Rr)*(r-Rr) + (g-Gg)*(g-Gg) + (b-Bb)*(b-Bb)
+                    if d < bestd:
+                        bestd, best = d, t
+                return best
+
+            grid = [[nearest_token(block_avg(i,j)) for j in range(C)]
+                    for i in range(R)]
+            floors[z] = grid
+
+        # second pass: build multi-floor graph
+        graph = defaultdict(lambda: {'nbrs': set()})
+        Z = len(floors)
+        for z, grid in floors.items():
+            R, C = len(grid), len(grid[0])
+            for i in range(R):
+                for j in range(C):
+                    tok = grid[i][j]
+                    attrs = graph[(z,i,j)]
+                    # standard flags
+                    for att in "WSBFNP":
+                        attrs[att] = int(att == tok)
+                    # stairs flags
+                    for att in ("SD","SU","TD","TU"):
+                        attrs[att] = int(att == tok)
+                    # neighbors within same floor
+                    for di,dj in ((-1,0),(1,0),(0,-1),(0,1)):
+                        i2, j2 = i+di, j+dj
+                        if 0 <= i2 < R and 0 <= j2 < C:
+                            graph[(z,i,j)]['nbrs'].add((z,i2,j2))
+
+        # vertical connectivity using TD/TU
+        for z, grid in floors.items():
+            R, C = len(grid), len(grid[0])
+            for i in range(R):
+                for j in range(C):
+                    tok = grid[i][j]
+                    key = (z,i,j)
+                    # teleport down to floor z-1
+                    if tok == 'TD' and z-1 in floors:
+                        tgt = (z-1, i, j)
+                        graph[key]['nbrs'].add(tgt)
+                        graph[tgt]['nbrs'].add(key)
+                    # teleport up to floor z+1
+                    if tok == 'TU' and z+1 in floors:
+                        tgt = (z+1, i, j)
+                        graph[key]['nbrs'].add(tgt)
+                        graph[tgt]['nbrs'].add(key)
+
         self.graph = dict(graph.items())
         return self.graph
